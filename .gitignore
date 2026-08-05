@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+desktop/
+laptop/
+
+# VS Code settings
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Misc
+/quicklooks_output
+/spice
