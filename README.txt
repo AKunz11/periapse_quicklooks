@@ -17,11 +17,15 @@ What you need to do:
 1. Install requirements
    pip install -r requirements.txt
 
-2. Update paths in lines 42-46
+2. Install spice kernels
+   Use the chatGPT generated download_spice.py
+   It might work im not sure
 
-3. Update orbit range in lines 38-40
+3. Update paths in lines 42-46
 
-4. Run code and wait a few
+4. Update orbit range in lines 38-40
+
+5. Run code and wait a few
 
 
 Notes:
@@ -50,3 +54,10 @@ Have you ever wanted to view the MLR fit for an orbit and scan? NOW YOU CAN!
    mlr_app creates an interactive plot to view each of the fit components on the spectra!
    Likely will have to update paths to files in the open_l1b and open_l1c functions
    Run like a normal python script, and then open the link it outputs in a browser
+
+=======================================================================================================================================================
+Spice kernels
+
+Use download_spice.py to hopefully download all the spice in the directory structure the code expects.
+ChatGPT made this and I'm nervous to test it so best of luck
+There were too many spice files to put on github
