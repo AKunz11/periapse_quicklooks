@@ -1,39 +1,77 @@
 from pathlib import Path
 from pypdf import PdfWriter
-import glob
 import pandas as pd
 import re
 import numpy as np
 
-orb_start=8000
-orb_end=9000
-csv_folder = Path("D:/nightglow/tables_cnn")
-csv_files = sorted(csv_folder.glob("*_detections_short_cnn.csv"))
+orb_start = 8000
+orb_end = 9000
 
-df = pd.concat(
-    (pd.read_csv(f) for f in csv_files),
-    ignore_index=True
+# Load merged comparison CSV
+df = pd.read_csv(
+    f"D:/ml_project/model_compare/{orb_start:05d}_{orb_end:05d}_merged.csv"
 )
 
-df = df[(df["orbit_number"]>=orb_start) & (df["orbit_number"]<orb_end) & (df["color_flag_muv"]=="green")]
+# Keep only CNN-only detections that are green or yellow
+df_new = df[
+    (df["method_match"] == "cnn_only") | (df["method_match"] == "both")
+    & (df["color_flag_muv_cnn"].isin(["green", "yellow"]))
+].copy()
 
-unique_orbits = set(df["orbit_number"].dropna().astype(int))
+df_old = df[
+    (df["method_match"] == "old_only") | (df["method_match"] == "both")
+    & (df["color_flag_muv_old"].isin(["green", "yellow"]))
+].copy()
+
+# Unique CNN-only orbit numbers
+unique_orbits = set(
+    df_old["orbit_number_old"]
+    .dropna()
+    .astype(int)
+    .unique()
+)
+
+print(f"CNN-only rows: {len(df_new)}")
+print(f"CNN-only unique orbits: {len(unique_orbits)}")
+print("Orbits:", sorted(unique_orbits))
+print("=" * 80)
+
 
 def get_orbit_number(pdf_path):
     """Extract a standalone five-digit orbit number from the filename."""
     match = re.search(r"(?<!\d)(\d{5})(?!\d)", pdf_path.stem)
-
     return int(match.group(1)) if match else None
 
-for num in np.arange(orb_start,orb_end,100):
-    orb_block=num
-    input_folder = Path(f"D:/nightglow/quicklooks_out_cnn/{orb_block:05d}")
-    output_pdf = input_folder / f"combined_quicklooks_{orb_block:05d}.pdf"
 
-    pdf_files = sorted(pdf for pdf in input_folder.glob("*.pdf") if pdf.name != output_pdf.name and get_orbit_number(pdf) in unique_orbits)
+# Keep track ONLY of block PDFs created during this run
+created_block_pdfs = []
+
+for num in np.arange(orb_start, orb_end, 100):
+
+    orb_block = int(num)
+
+    input_folder = Path(
+        f"D:/nightglow/quicklooks_out/{orb_block:05d}"
+    )
+
+    output_pdf = (
+        input_folder
+        / f"combined_quicklooks_{orb_block:05d}.pdf"
+    )
+
+    # Find orbit PDFs belonging to CNN-only detections
+    pdf_files = sorted(
+        pdf
+        for pdf in input_folder.glob("*.pdf")
+        if pdf.name != output_pdf.name
+        and get_orbit_number(pdf) in unique_orbits
+    )
 
     if not pdf_files:
-        print(f"No PDFs matching the orbit list were found in {orb_block:05d}")
+        print(
+            f"No CNN-only PDFs found in block "
+            f"{orb_block:05d}"
+        )
         continue
 
     writer = PdfWriter()
@@ -47,25 +85,43 @@ for num in np.arange(orb_start,orb_end,100):
 
     writer.close()
 
-    print(f"\nCombined {len(pdf_files)} PDFs into:")
+    # IMPORTANT:
+    # Only add PDFs actually created during THIS run
+    created_block_pdfs.append(output_pdf)
+
+    print(
+        f"\nCombined {len(pdf_files)} PDFs into:"
+    )
     print(output_pdf)
-    print('='*80 + '\n')
+    print("=" * 80 + "\n")
 
-base_folder = Path("D:/nightglow/quicklooks_out_cnn")
-final_output_pdf = base_folder / f"combined_quicklooks_{orb_start:05d}_{orb_end:05d}.pdf"
 
-combined_pdfs = sorted(
-    base_folder.glob("*/combined_quicklooks_*.pdf"),
-    key=lambda pdf: get_orbit_number(pdf) or -1
+# ============================================================
+# Final merge
+# ============================================================
+
+base_folder = Path(
+    "D:/nightglow/quicklooks_out"
 )
 
-if not combined_pdfs:
-    print("No combined PDFs were found. Skipping final merge.")
+final_output_pdf = (
+    base_folder
+    / f"combined_quicklooks_"
+      f"{orb_start:05d}_{orb_end:05d}_old.pdf"
+)
+
+if not created_block_pdfs:
+
+    print(
+        "No block PDFs were created. "
+        "Skipping final merge."
+    )
 
 else:
+
     writer = PdfWriter()
 
-    for pdf_file in combined_pdfs:
+    for pdf_file in created_block_pdfs:
         print(f"Adding block: {pdf_file}")
         writer.append(str(pdf_file))
 
@@ -74,6 +130,9 @@ else:
 
     writer.close()
 
-    print(f"\nCombined {len(combined_pdfs)} block PDFs into:")
+    print(
+        f"\nCombined {len(created_block_pdfs)} "
+        f"block PDFs into:"
+    )
     print(final_output_pdf)
-    print('='*80)
+    print("=" * 80)

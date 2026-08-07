@@ -27,7 +27,7 @@ from pathlib import Path
 
 # Orbit-block configuration
 RUN_START = 8000
-RUN_END = 9000      # exclusive; last orbit processed is 11999
+RUN_END = 8100      # exclusive; last orbit processed is 11999
 BLOCK_SIZE = 100
 
 BASE_L1C = Path("D:/nightglow/c")
@@ -1202,6 +1202,11 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         TABLE_OUTPUT_DIR
         / f"{block_start_str}_{block_end_str}_detections_short_{version}.csv"
     )
+
+    # Remove old output so detections from previous runs aren't retained
+    if block_csv_path.exists():
+        block_csv_path.unlink()
+
 
     block_quicklook_dir = QUICKLOOK_OUTPUT_DIR / block_start_str
     block_spectra_dir = SPECTRA_OUTPUT_DIR / block_start_str
