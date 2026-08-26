@@ -26,12 +26,12 @@ from PyUVS.spice import load_iuvs_spice
 from pathlib import Path
 
 # Orbit-block configuration
-RUN_START = 8000
-RUN_END = 8100      # exclusive; last orbit processed is 11999
+RUN_START = 15300
+RUN_END = 15400      # exclusive; last orbit processed is 11999
 BLOCK_SIZE = 100
 
-BASE_L1C = Path("D:/nightglow/c")
-BASE_L1B = Path("D:/nightglow/b")
+BASE_L1C = Path("E:/nightglow/c")
+BASE_L1B = Path("E:/nightglow/b")
 TABLE_OUTPUT_DIR = Path("D:/nightglow/tables")
 QUICKLOOK_OUTPUT_DIR = Path("D:/nightglow/quicklooks_out")
 SPECTRA_OUTPUT_DIR = Path("D:/nightglow/spectra_out")

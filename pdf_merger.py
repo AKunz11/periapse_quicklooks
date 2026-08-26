@@ -4,37 +4,90 @@ import pandas as pd
 import re
 import numpy as np
 
-orb_start = 8000
-orb_end = 9000
+orb_start = 15200
+orb_end = 15300
+method = "new" #old or new
+unique = False #only in the new/old method, NO overlap
+reject = False #reject by eye stuff
+
+# By eye rejections
+rejects_old=[8098.08 ,8145.11, 8212.01, 8281.08, 8323.06, 8362.01, 8577.02, 8594.08, 8607.08,
+             8621.07, 8632.06, 8635.11, 8681.04, 8681.09, 8700.03, 8998.01]
+
+rejects_cnn=[8384.03, 8856.12, 8986.02]
 
 # Load merged comparison CSV
 df = pd.read_csv(
     f"D:/ml_project/model_compare/{orb_start:05d}_{orb_end:05d}_merged.csv"
 )
 
-# Keep only CNN-only detections that are green or yellow
-df_new = df[
-    (df["method_match"] == "cnn_only") | (df["method_match"] == "both")
-    & (df["color_flag_muv_cnn"].isin(["green", "yellow"]))
-].copy()
 
-df_old = df[
-    (df["method_match"] == "old_only") | (df["method_match"] == "both")
-    & (df["color_flag_muv_old"].isin(["green", "yellow"]))
-].copy()
 
-# Unique CNN-only orbit numbers
+if method == "new":
+
+    # Choose which method_match values to keep
+    if unique:
+        method_types = ["cnn_only"]
+    else:
+        method_types = ["cnn_only", "both"]
+
+    selected_df = df[
+        df["method_match"].isin(method_types)
+        & df["color_flag_muv_cnn"].isin(["green", "yellow"])
+    ].copy()
+
+    # Remove by-eye rejected detections
+    if reject:
+        selected_df = selected_df[
+            ~selected_df["nick_number"].isin(rejects_cnn)
+        ]
+
+    orbit_column = "orbit_number_cnn"
+
+
+elif method == "old":
+
+    # Choose which method_match values to keep
+    if unique:
+        method_types = ["old_only"]
+    else:
+        method_types = ["old_only", "both"]
+
+    selected_df = df[
+        df["method_match"].isin(method_types)
+        & df["color_flag_muv_old"].isin(["green", "yellow"])
+    ].copy()
+
+    # Remove by-eye rejected detections
+    if reject:
+        selected_df = selected_df[
+            ~selected_df["nick_number"].isin(rejects_old)
+        ]
+
+    orbit_column = "orbit_number_old"
+
+
+else:
+    raise ValueError("method must be 'new' or 'old'")
+
+
+# Get orbit numbers to include in PDF
 unique_orbits = set(
-    df_old["orbit_number_old"]
+    selected_df[orbit_column]
     .dropna()
     .astype(int)
     .unique()
 )
 
-print(f"CNN-only rows: {len(df_new)}")
-print(f"CNN-only unique orbits: {len(unique_orbits)}")
+
+print(f"Method: {method}")
+print(f"Unique only: {unique}")
+print(f"Detection rows: {len(selected_df)}")
+print(f"Unique orbits: {len(unique_orbits)}")
 print("Orbits:", sorted(unique_orbits))
 print("=" * 80)
+
+
 
 
 def get_orbit_number(pdf_path):
@@ -50,16 +103,26 @@ for num in np.arange(orb_start, orb_end, 100):
 
     orb_block = int(num)
 
-    input_folder = Path(
-        f"D:/nightglow/quicklooks_out/{orb_block:05d}"
-    )
+    if method == "new":
+        input_folder = Path(
+            f"D:/nightglow/quicklooks_out_cnn/{orb_block:05d}"
+        )
 
-    output_pdf = (
-        input_folder
-        / f"combined_quicklooks_{orb_block:05d}.pdf"
-    )
+        output_pdf = (
+            input_folder
+            / f"combined_quicklooks_{orb_block:05d}.pdf"
+        )
+    else:
+        input_folder = Path(
+            f"D:/nightglow/quicklooks_out/{orb_block:05d}"
+        )
 
-    # Find orbit PDFs belonging to CNN-only detections
+        output_pdf = (
+            input_folder
+            / f"combined_quicklooks_{orb_block:05d}.pdf"
+        )
+
+    # Find orbit PDFs belonging to detections
     pdf_files = sorted(
         pdf
         for pdf in input_folder.glob("*.pdf")
@@ -69,7 +132,7 @@ for num in np.arange(orb_start, orb_end, 100):
 
     if not pdf_files:
         print(
-            f"No CNN-only PDFs found in block "
+            f"No PDFs found in block "
             f"{orb_block:05d}"
         )
         continue
@@ -100,15 +163,30 @@ for num in np.arange(orb_start, orb_end, 100):
 # Final merge
 # ============================================================
 
-base_folder = Path(
-    "D:/nightglow/quicklooks_out"
-)
+suffix = "_unique" if unique else ""
 
-final_output_pdf = (
-    base_folder
-    / f"combined_quicklooks_"
-      f"{orb_start:05d}_{orb_end:05d}_old.pdf"
-)
+if method == "new":
+    base_folder = Path(
+        "D:/nightglow/quicklooks_out_cnn"
+    )
+
+    final_output_pdf = (
+        base_folder
+        / f"combined_quicklooks_"
+        f"{orb_start:05d}_{orb_end:05d}_new{suffix}.pdf"
+    )
+
+else:
+    base_folder = Path(
+        "D:/nightglow/quicklooks_out"
+    )
+
+    final_output_pdf = (
+        base_folder
+        / f"combined_quicklooks_"
+        f"{orb_start:05d}_{orb_end:05d}_old{suffix}.pdf"
+    )
+
 
 if not created_block_pdfs:
 

@@ -24,3 +24,5 @@ Thumbs.db
 # Misc
 /quicklooks_output
 /spice
+pdf_merger.py
+cr_labeling.py
