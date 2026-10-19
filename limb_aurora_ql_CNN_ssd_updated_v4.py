@@ -11,10 +11,11 @@ import numpy as np
 import pandas as pd
 import sklearn.metrics as metrics
 import spiceypy as spice
+import tensorflow as tf
+from pathlib import Path
 from astropy.io import fits
 from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon
-from matplotlib.patches import Rectangle
 from scipy.io import readsav
 from scipy.ndimage import gaussian_filter
 from scipy.stats import pearsonr
@@ -23,31 +24,95 @@ from PyUVS.graphics import CO_colormap, CO2p_colormap, H_colormap, JGR_format, c
 from PyUVS.variables import R_Mars_km
 from PyUVS.data import calculate_calibration_curve
 from PyUVS.spice import load_iuvs_spice
-from pathlib import Path
 
-# Orbit-block configuration
-RUN_START = 15300
-RUN_END = 15400      # exclusive; last orbit processed is 11999
-BLOCK_SIZE = 100
+#TODO List
+# Run 7300 due to error
+# Error at 23956
+# Error at 14863
+
+
+# CNN cosmic-ray configuration
+CR_MODEL_FILE = Path("cosmic_ray_model.keras")
+CR_THRESHOLD = 0.75
+CR_REFERENCE_ORBIT = 8212 # to get shape of data for building cnn cube
+
+#Helpful numbers
+RUN_START = 18700
+RUN_END = 18800  # exclusive, so the last orbit processed is 11999
+BLOCK_SIZE = 100    # run in 100 orbit blocks (e.g. 8600-8700, 8700-8800)
 
 BASE_L1C = Path("E:/nightglow/c")
 BASE_L1B = Path("E:/nightglow/b")
-TABLE_OUTPUT_DIR = Path("D:/nightglow/tables")
-QUICKLOOK_OUTPUT_DIR = Path("D:/nightglow/quicklooks_out")
-SPECTRA_OUTPUT_DIR = Path("D:/nightglow/spectra_out")
+TABLE_OUTPUT_DIR = Path("E:/nightglow/tables_cnn")
+QUICKLOOK_OUTPUT_DIR = Path("E:/nightglow/quicklooks_out_cnn")
+SPECTRA_OUTPUT_DIR = Path("E:/nightglow/spectra_out")
 
 TABLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 QUICKLOOK_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SPECTRA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+def build_l1b_scan_mapping(l1bfiles, l1c_hdul):
+    """Map each L1C scan to the L1B file with the nearest start UTC."""
+
+    l1b_times = []
+
+    for filepath in l1bfiles:
+        with fits.open(
+            filepath,
+            ignore_missing_simple=True,
+            ignore_missing_end=True,
+        ) as hdul:
+
+            utc = hdul["integration"].data["utc"][0]
+
+            dt = datetime.strptime(
+                utc,
+                "%Y/%j %b %d %H:%M:%S.%fUTC"
+            )
+
+            l1b_times.append((filepath, dt))
+
+    mapping = []
+
+    for scan in range(
+        l1c_hdul["integration"].data["utc"].shape[0]
+    ):
+
+        l1c_utc = l1c_hdul["integration"].data["utc"][scan, 0]
+
+        l1c_dt = datetime.strptime(
+            l1c_utc,
+            "%Y/%j %b %d %H:%M:%S.%fUTC"
+        )
+
+        best_file, best_time = min(
+            l1b_times,
+            key=lambda item: abs(
+                (item[1] - l1c_dt).total_seconds()
+            )
+        )
+
+        dt_seconds = abs(
+            (best_time - l1c_dt).total_seconds()
+        )
+
+        mapping.append(best_file)
+
+        print(
+            f"L1C scan {scan + 1} -> "
+            f"{os.path.basename(best_file)} "
+            f"(Δt={dt_seconds:.3f} s)"
+        )
+
+    return mapping
 
 def format_orbit(orbit):
     """Return a five-digit orbit/folder string."""
     return f"{orbit:05d}"
 
 
-def orbit_block_start(orbit, block_size=BLOCK_SIZE):
-    """Return the beginning of the block containing an orbit."""
+def orbit_block_start(orbit, block_size=100):
+    """Return the beginning of the orbit's 100-orbit block."""
     return (orbit // block_size) * block_size
 
 # print progress report
@@ -64,12 +129,13 @@ def progress_report(start_time, iterator, orbit, n_orbits):
 # function to return FITS files for levels 1B and 1C
 def get_fits(orbit, channel):
     orbit_str = format_orbit(orbit)
+     # Determine which 100-orbit folder contains this orbit.
+    block_start = orbit_block_start(orbit, BLOCK_SIZE)
+    block_folder = format_orbit(block_start)
 
-    # Determine the input folder from the orbit itself.
-    block_folder = format_orbit(orbit_block_start(orbit))
+    l1c_pattern = (BASE_L1C / block_folder / f"*periapse*orbit{orbit_str}*.gz")
 
-    l1c_pattern = BASE_L1C / block_folder / f"*periapse*orbit{orbit_str}*.gz"
-    l1b_pattern = BASE_L1B / block_folder / f"*periapse*orbit{orbit_str}-{channel}*.gz"
+    l1b_pattern = (BASE_L1B / block_folder / f"*periapse*orbit{orbit_str}-{channel}*.gz")
 
     l1c_files = sorted(glob.glob(str(l1c_pattern)))
     l1b_files = sorted(glob.glob(str(l1b_pattern)))
@@ -133,85 +199,261 @@ def place_scan_image(axis, altitude_array, radiance, colormap, norm):
             pixel = Polygon(vertices, closed=True, facecolor=pixel_color)
             axis.add_patch(pixel)
 
+def outline_cr_rejected_pixels(axes, cr_rejected):
+    """Outline every spatial pixel in CR-rejected integrations in yellow."""
+
+    rejected_integrations = np.where(cr_rejected)[0]
+
+    for integration in rejected_integrations:
+        for spatial_bin in range(n_spa):
+            x_coords = [
+                1 / 7 * (6 - spatial_bin) + scan,
+                1 / 7 * (6 - spatial_bin) + scan,
+                1 / 7 * (6 - spatial_bin + 1) + scan,
+                1 / 7 * (6 - spatial_bin + 1) + scan,
+                1 / 7 * (6 - spatial_bin) + scan,
+            ]
+
+            y_coords = [
+                altitude[integration, spatial_bin, 3],
+                altitude[integration, spatial_bin, 2],
+                altitude[integration, spatial_bin, 0],
+                altitude[integration, spatial_bin, 1],
+                altitude[integration, spatial_bin, 3],
+            ]
+
+            for axis in axes:
+                axis.plot(
+                    x_coords,
+                    y_coords,
+                    color=color_dict["yellow"],
+                    linewidth=0.8,
+                    alpha=0.2,
+                    zorder=3,
+                )
 
 def outline_pixels(axes, flags):
-    # make a new flag array for temporary storage
     temp_flag = np.zeros_like(flags)
+    coords = []
 
-    # calculate signal-to-noise ratios
-    co_snr = co_cameron_radiance / co_cameron_uncertainty
-    co2p_snr = co2p_uvd_radiance / co2p_uvd_uncertainty
-    good_ind = np.squeeze(np.where(((co_snr > 4) | (co2p_snr > 3)) & (sza > 105) & (flags == 1)))
-    if np.isscalar(good_ind[0]):
-        good_int = np.array([good_ind[0]])
-        good_spa = np.array([good_ind[1]])
-    else:
-        good_int = good_ind[0]
-        good_spa = good_ind[1]
+    # Avoid divide-by-zero warnings
+    co_snr = np.divide(
+        co_cameron_radiance,
+        co_cameron_uncertainty,
+        out=np.zeros_like(co_cameron_radiance, dtype=float),
+        where=co_cameron_uncertainty != 0
+    )
+
+    co2p_snr = np.divide(
+        co2p_uvd_radiance,
+        co2p_uvd_uncertainty,
+        out=np.zeros_like(co2p_uvd_radiance, dtype=float),
+        where=co2p_uvd_uncertainty != 0
+    )
+
+    # These are always arrays, including when there are zero or one matches
+    good_int, good_spa = np.where(
+        ((co_snr > 4) | (co2p_snr > 3))
+        & (sza > 105)
+        & (flags == 1)
+    )
+
+    n_good_pixels = len(good_int)
+
+    # Handle zero good pixels immediately
+    if n_good_pixels == 0:
+        flags *= temp_flag
+        return flags, np.nan, np.nan
 
     for integration, spatial_bin in zip(good_int, good_spa):
-        x_coords = [1 / 7 * (6 - spatial_bin) + scan, 1 / 7 * (6 - spatial_bin) + scan,
-                    1 / 7 * (6 - spatial_bin + 1) + scan, 1 / 7 * (6 - spatial_bin + 1) + scan,
-                    1 / 7 * (6 - spatial_bin) + scan]
-        y_coords = [altitude[integration, spatial_bin, 3], altitude[integration, spatial_bin, 2],
-                    altitude[integration, spatial_bin, 0], altitude[integration, spatial_bin, 1],
-                    altitude[integration, spatial_bin, 3]]
-        [axis.plot(x_coords, y_coords, linewidth=0.5, zorder=2, color=color_dict['grey']) for axis in axes]
+        x_coords = [
+            1 / 7 * (6 - spatial_bin) + scan,
+            1 / 7 * (6 - spatial_bin) + scan,
+            1 / 7 * (6 - spatial_bin + 1) + scan,
+            1 / 7 * (6 - spatial_bin + 1) + scan,
+            1 / 7 * (6 - spatial_bin) + scan
+        ]
+
+        y_coords = [
+            altitude[integration, spatial_bin, 3],
+            altitude[integration, spatial_bin, 2],
+            altitude[integration, spatial_bin, 0],
+            altitude[integration, spatial_bin, 1],
+            altitude[integration, spatial_bin, 3]
+        ]
+
+        for axis in axes:
+            axis.plot(
+                x_coords,
+                y_coords,
+                linewidth=0.5,
+                zorder=2,
+                color=color_dict["grey"]
+            )
+
+        coords.append([
+            np.mean(x_coords[:4]),
+            np.mean(y_coords[:4])
+        ])
+
         temp_flag[integration, spatial_bin] = 1
 
-    # multiply the flag arrays
-    flags *= temp_flag
+    spatial_coords = good_spa.astype(float)
+    integration_coords = good_int.astype(float)
+    coords = np.asarray(coords)
 
-    return flags
+    # Detector-coordinate centroid: [spatial bin, integration]
+    centroid_detector = np.array([
+        np.mean(spatial_coords),
+        np.mean(integration_coords)
+    ])
+
+    # Plot-coordinate centroid: [scan position, altitude]
+    centroid_reg = np.mean(coords, axis=0)
+
+    dist_x_detector = spatial_coords - centroid_detector[0]
+    dist_y_detector = integration_coords - centroid_detector[1]
+
+    dist_x_reg = coords[:, 0] - centroid_reg[0]
+    dist_y_reg = coords[:, 1] - centroid_reg[1]
+
+    rms_x_detector = np.sqrt(np.mean(dist_x_detector**2))
+    rms_y_detector = np.sqrt(np.mean(dist_y_detector**2))
+
+    rms_x_reg = np.sqrt(np.mean(dist_x_reg**2))
+    rms_y_reg = np.sqrt(np.mean(dist_y_reg**2))
+
+    if n_good_pixels > 1:
+        for axis in axes:
+            axis.plot(
+                centroid_reg[0],
+                centroid_reg[1],
+                marker="x",
+                linestyle="none",
+                color=color_dict["yellow"],
+                markersize=5,
+                zorder=3
+            )
+
+            axis.text(
+                scan + 0.95,
+                0.95,
+                f"X: {rms_x_reg:.3f}\n" #scan position (fractional scan number)
+                f"Y: {rms_y_reg:.3f}", #altitude (km)
+                transform=axis.get_xaxis_transform(),
+                fontsize=8,
+                color=color_dict["yellow"],
+                ha="right",
+                va="top",
+                zorder=3
+            )
+
+        flags *= temp_flag
+        return flags, rms_x_reg, rms_y_reg
+
+    # Exactly one good pixel
+    flags *= temp_flag
+    return flags, np.nan, np.nan
 
 
 def calculate_periapse_distance(l1c_hdul, r):
-    # find spacecraft position at periapse
-    spacecraft_altitude = l1c_hdul['spacecraftgeometry'].data['spacecraft_alt']
-    periapse_ind = np.unravel_index(spacecraft_altitude.argmin(), spacecraft_altitude.shape)
-    latitude_1 = np.radians(hdull1c['spacecraftgeometry'].data['sub_spacecraft_lat'][periapse_ind])
-    longitude_1 = np.radians(hdull1c['spacecraftgeometry'].data['sub_spacecraft_lon'][periapse_ind])
+    sc_geom = l1c_hdul["spacecraftgeometry"].data
+    pix_geom = l1c_hdul["pixelgeometry"].data
 
-    # find coordinates of first scan center element which intersects 135 km altitude
-    first_scan_altitude = l1c_hdul['pixelgeometry'].data['pixel_corner_mrh_alt'][0]
-    ind135_0 = np.abs(first_scan_altitude[:, 3, 4] - 135).argmin()
-    latitude_radians = rearrange_dimensions(np.radians(l1c_hdul['pixelgeometry'].data['pixel_corner_lat'][0]))
-    longitude_radians = rearrange_dimensions(np.radians(l1c_hdul['pixelgeometry'].data['pixel_corner_lon'][0]))
-    lat135_0 = latitude_radians[ind135_0, 3, 4]
-    lon135_0 = longitude_radians[ind135_0, 3, 4]
-    sc_latitude_rad = np.radians(hdull1c['spacecraftgeometry'].data['sub_spacecraft_lat'][0])
-    sc_longitude_rad = np.radians(hdull1c['spacecraftgeometry'].data['sub_spacecraft_lon'][0])
-    sclat135_0 = sc_latitude_rad[ind135_0]
-    sclon135_0 = sc_longitude_rad[ind135_0]
+    spacecraft_altitude = np.asarray(sc_geom["spacecraft_alt"], dtype=float)
 
-    # calculate physical distance between spacecraft and first scan 135 km position calculated above
-    a = abs(np.sin((lat135_0 - sclat135_0) / 2) ** 2 +
-            np.cos(lat135_0) * np.cos(sclon135_0) * np.sin((lon135_0 - sclon135_0) / 2) ** 2)
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    dist = r * c
+    if not np.any(np.isfinite(spacecraft_altitude)):
+        raise ValueError("No finite spacecraft altitudes")
 
-    # calculate coordinates of first integration, first bin corner projected into 135 km plane
-    llos = dist  # length of line-of-sight [km]
-    dlos = 1  # sample spacing along line-of-sight [km]
-    n_los_samp = int(llos / dlos)  # number of samples along line-of-sight
-    body_radii = spice.bodvrd('Mars', 'RADII', 3)[1]
-    los_vec_arr = np.swapaxes(hdull1c['pixelgeometry'].data['pixel_vec'][:, :, :, :], 1, 4)
-    sc_vec_arr = np.swapaxes(hdull1c['spacecraftgeometry'].data['v_spacecraft'], 1, 2)
-    sc_vec = sc_vec_arr[0, 0]
-    los_vec = los_vec_arr[0, 0, -1, 2]
-    los_samp_vec_arr = np.matmul(np.linspace(0, llos, n_los_samp)[:, None], los_vec[None, :])
-    los_samp_vec_arr += sc_vec
-    npoint, samp_alt = spice.nearpt(los_samp_vec_arr[-1], body_radii[0], body_radii[1], body_radii[2])
-    rpoint, colatpoint, lonpoint = spice.recsph(npoint)
+    periapse_ind = np.unravel_index(
+        np.nanargmin(spacecraft_altitude),
+        spacecraft_altitude.shape
+    )
+
+    latitude_1 = np.radians(sc_geom["sub_spacecraft_lat"][periapse_ind])
+    longitude_1 = np.radians(sc_geom["sub_spacecraft_lon"][periapse_ind])
+
+    # Find a valid integration in the first scan near 135 km
+    first_altitude = rearrange_dimensions(
+        np.asarray(pix_geom["pixel_corner_mrh_alt"][0], dtype=float)
+    )
+
+    first_latitude = rearrange_dimensions(
+        np.radians(pix_geom["pixel_corner_lat"][0])
+    )
+
+    first_longitude = rearrange_dimensions(
+        np.radians(pix_geom["pixel_corner_lon"][0])
+    )
+
+    sc_lat = np.radians(sc_geom["sub_spacecraft_lat"][0])
+    sc_lon = np.radians(sc_geom["sub_spacecraft_lon"][0])
+
+    candidates = first_altitude[:, 3, 4]
+
+    valid = (
+        np.isfinite(candidates)
+        & np.isfinite(first_latitude[:, 3, 4])
+        & np.isfinite(first_longitude[:, 3, 4])
+        & np.isfinite(sc_lat)
+        & np.isfinite(sc_lon)
+    )
+
+    if not np.any(valid):
+        raise ValueError("First scan has no valid 135-km reference geometry")
+
+    candidate_indices = np.flatnonzero(valid)
+    ind135_0 = candidate_indices[
+        np.argmin(np.abs(candidates[valid] - 135))
+    ]
+
+    lat135_0 = first_latitude[ind135_0, 3, 4]
+    lon135_0 = first_longitude[ind135_0, 3, 4]
+
+    sclat135_0 = sc_lat[ind135_0]
+    sclon135_0 = sc_lon[ind135_0]
+
+    # Angular separation
+    a = (
+        np.sin((lat135_0 - sclat135_0) / 2) ** 2
+        + np.cos(lat135_0) * np.cos(sclat135_0)
+        * np.sin((lon135_0 - sclon135_0) / 2) ** 2
+    )
+
+    c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
+    llos = float(r * c)
+
+    if not np.isfinite(llos) or llos <= 0:
+        raise ValueError(f"Invalid LOS distance: {llos}")
+
+    # Project the reference LOS into Mars coordinates
+    body_radii = spice.bodvrd("Mars", "RADII", 3)[1]
+
+    los_vec_arr = np.swapaxes(pix_geom["pixel_vec"], 1, 4)
+    sc_vec_arr = np.swapaxes(sc_geom["v_spacecraft"], 1, 2)
+
+    sc_vec = np.asarray(sc_vec_arr[0, 0], dtype=float)
+    los_vec = np.asarray(los_vec_arr[0, 0, -1, 2], dtype=float)
+
+    if not np.all(np.isfinite(sc_vec)) or not np.all(np.isfinite(los_vec)):
+        raise ValueError("Invalid reference spacecraft or LOS vector")
+
+    endpoint = sc_vec + llos * los_vec
+
+    npoint, _ = spice.nearpt(endpoint, *body_radii)
+    _, colatpoint, lonpoint = spice.recsph(npoint)
+
     latitude_0 = np.pi / 2 - colatpoint
-    longitude_0 = lonpoint
-    if longitude_0 < 0:
-        longitude_0 += 2 * np.pi
+    longitude_0 = lonpoint % (2 * np.pi)
 
-    # calculate distance between periapse and the first integration, first bin corner
-    a = np.sin((latitude_1 - latitude_0) / 2) ** 2 + \
-        np.cos(latitude_1) * np.cos(latitude_0) * np.sin((longitude_1 - longitude_0) / 2) ** 2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    # Distance relative to periapsis
+    a = (
+        np.sin((latitude_1 - latitude_0) / 2) ** 2
+        + np.cos(latitude_1) * np.cos(latitude_0)
+        * np.sin((longitude_1 - longitude_0) / 2) ** 2
+    )
+
+    c = 2 * np.arcsin(np.sqrt(np.clip(a, 0, 1)))
     r_periapse = r * c
 
     return r_periapse, latitude_0, longitude_0
@@ -219,7 +461,16 @@ def calculate_periapse_distance(l1c_hdul, r):
 
 def place_scan_image_physical(axis, r_periapse, latitude_0, longitude_0, radiance, colormap, norm):
     # find where center element is closest to 135 km and get coordinates
-    ind135 = np.abs(altitude[:, 3, 4] - 135).argmin()
+    alt135 = altitude[:, 3, 4]
+
+    if not np.any(np.isfinite(alt135)):
+        return (
+            np.full_like(latitude_rad, np.nan),
+            np.full_like(longitude_rad, np.nan),
+            np.full_like(altitude, np.nan)
+        )
+
+    ind135 = np.nanargmin(np.abs(alt135 - 135))
     lat135 = latitude_rad[ind135, 3, 4]
     lon135 = longitude_rad[ind135, 3, 4]
     sclat135 = sc_lat_rad[ind135]
@@ -321,38 +572,195 @@ def place_detector_images(axes, plot_wavelength, plot_spectra):
         axes[integration].set_frame_on(False)
 
 
-def cosmic_ray_filtering(axes):
-    # make data flag array to hold locations of good data and variable to indicate manual checking
-    flags = np.ones((n_int, n_spa))
-    check = 0
+def get_reference_wavelength(reference_orbit=CR_REFERENCE_ORBIT):
+    """Load the 256-bin wavelength grid used to train the CNN."""
+    folder = BASE_L1C / f"{(reference_orbit // 100) * 100:05d}"
+    filepath = next(
+        folder.glob(f"mvn_iuv_l1c_periapse-orbit{reference_orbit:05d}*"),
+        None,
+    )
+    if filepath is None:
+        raise FileNotFoundError(
+            f"No reference L1C file found for orbit {reference_orbit} in {folder}"
+        )
 
-    # initial filtering
-    for integration in range(n_int):
-        for spatial_bin in range(n_spa):
-            if (abs(const[integration, spatial_bin] > threshold_const) |
-                    abs(chisq[integration, spatial_bin] > threshold_chisq) | (sza[integration, spatial_bin] < 102)):
-                flags[integration, :] = 0
+    with fits.open(filepath, ignore_missing_simple=True, ignore_missing_end=True) as hdul:
+        wavelength = np.asarray(
+            hdul["observation"].data["WAVELENGTH_MUV"][0],
+            dtype=float,
+        )
 
-    # color the scans appropriately
-    bad_ints = np.unique(np.where(flags == 0)[0])
-    for integration in bad_ints:
-        #axes[integration].axhspan(0, 7, color=color_dict['cyan'], linewidth=0, alpha=0.5)
-        overlay = Rectangle(
-                    (0, 0),
-                    1,
-                    1,
-                    transform=axes[integration].transAxes,
-                    facecolor="dodgerblue",
-                    edgecolor="deepskyblue",
-                    linewidth=1.5,
-                    alpha=0.5,
-                    zorder=10,
-                    clip_on=False
-                )
-        axes[integration].add_patch(overlay)
+    return wavelength[0, 0]
 
-    # return the flags and checks
-    return flags, check
+
+def preprocess_cnn_input(cube):
+    """Match cnn_train2 preprocessing exactly.
+
+    The training script loads X and passes it directly to model.fit without
+    scaling, standardization, clipping, or per-integration normalization.
+    Therefore inference must preserve the raw detector-value scale.  Casting
+    to float32 matches TensorFlow's normal input dtype without changing the
+    numerical scale.
+    """
+    cube = np.asarray(cube, dtype=np.float32)
+
+    if not np.all(np.isfinite(cube)):
+        bad_count = np.size(cube) - np.count_nonzero(np.isfinite(cube))
+        raise ValueError(
+            f"CNN input contains {bad_count} non-finite values. "
+            "These were not present or replaced during training, so inference "
+            "is stopped rather than applying an unmatched normalization."
+        )
+
+    return cube
+
+
+def build_cnn_orbit_input(l1c_hdul, target_wavelength):
+    """Return CNN input and mask of integrations safe for inference.
+
+    Non-finite fill values in the native L1C spectra are ignored during
+    interpolation. NumPy's normal endpoint behavior is retained so this
+    matches the original training/inference interpolation approach while
+    avoiding NaN fill values in the source spectrum.
+    """
+
+    cube = np.asarray(
+        l1c_hdul["SPECTRUM_NOALTBIN"].data["MUV"],
+        dtype=np.float32,
+    )
+
+    wavelength = np.asarray(
+        l1c_hdul["observation"].data["WAVELENGTH_MUV"][0],
+        dtype=float,
+    )
+
+    print("Cube shape:", cube.shape)
+    print("Target wavelength shape:", target_wavelength.shape)
+
+    print("NaNs:", np.count_nonzero(np.isnan(cube)))
+    print("Infs:", np.count_nonzero(np.isinf(cube)))
+
+    print(
+        "Integrations with non-finite values:",
+        np.count_nonzero(
+            ~np.all(np.isfinite(cube), axis=(2, 3))
+        )
+    )
+
+    print(
+        "Spatial bins entirely non-finite:",
+        np.count_nonzero(
+            ~np.any(np.isfinite(cube), axis=-1)
+        )
+    )
+
+    if (cube.shape[-1] != len(target_wavelength) or not np.all(np.isfinite(cube))):
+        cube_interp = np.full(
+            (*cube.shape[:-1], len(target_wavelength)),
+            np.nan,
+            dtype=np.float32,
+        )
+
+        for scan_index in range(cube.shape[0]):
+            for integration in range(cube.shape[1]):
+                for spatial_bin in range(cube.shape[2]):
+                    x = wavelength[scan_index, spatial_bin]
+                    y = cube[scan_index, integration, spatial_bin]
+
+                    valid = np.isfinite(x) & np.isfinite(y)
+
+                    # Need at least two finite wavelength/value pairs to interpolate.
+                    if np.count_nonzero(valid) < 2:
+                        continue
+
+                    x_valid = x[valid]
+                    y_valid = y[valid]
+
+                    # Ensure interpolation input is ordered by wavelength.
+                    order = np.argsort(x_valid)
+                    x_valid = x_valid[order]
+                    y_valid = y_valid[order]
+
+                    cube_interp[scan_index, integration, spatial_bin] = np.interp(
+                        target_wavelength,
+                        x_valid,
+                        y_valid,
+                    )
+
+        cube = cube_interp
+
+    # Flatten from:
+    # (scan, integration, spatial, wavelength)
+    # to:
+    # (scan * integration, spatial, wavelength)
+    cube = cube.reshape(-1, cube.shape[2], cube.shape[3])
+
+    # An integration is CNN-valid only if the final resampled input is finite.
+    valid_integrations = np.all(
+        np.isfinite(cube),
+        axis=(1, 2)
+    )
+
+    n_bad = np.count_nonzero(~valid_integrations)
+
+    if n_bad > 0:
+        print(
+            f"CNN: skipping {n_bad}/{len(valid_integrations)} "
+            f"integrations that still contain non-finite values after interpolation"
+        )
+
+    return cube, valid_integrations
+
+def cosmic_ray_filtering_cnn(axes, probabilities):
+    """Reject integrations flagged by CNN, old fit metrics, or low SZA."""
+
+    probabilities = np.asarray(probabilities).reshape(-1)
+
+    if len(probabilities) != n_int:
+        raise ValueError(
+            f"CNN returned {len(probabilities)} integrations; expected {n_int}."
+        )
+
+    #CNN rejection: one prediction per integration
+    predicted_cr=probabilities >= CR_THRESHOLD
+
+    #Old method chi-sq
+    baseline_bad_pixels=const > threshold_const
+    chisq_bad_pixels=chisq > threshold_chisq
+    low_sza_pixels=sza < 102
+    solar_bad=solar_coeff_per_integration > 100
+
+    baseline_bad=np.any(baseline_bad_pixels, axis=1)
+    chisq_bad=np.any(chisq_bad_pixels, axis=1)
+    low_sza=np.any(low_sza_pixels, axis=1)
+
+    old_method_rejected=baseline_bad | chisq_bad | solar_bad
+    rejected=predicted_cr | old_method_rejected | low_sza
+
+    cr_rejected = predicted_cr | old_method_rejected
+    rejected = cr_rejected | low_sza
+
+    flags=np.ones((n_int, n_spa), dtype=np.uint8)
+    flags[rejected, :]=0
+
+    # Shade every rejected integration
+    cnn_only = predicted_cr & ~old_method_rejected
+    old_only = old_method_rejected & ~predicted_cr
+    both = predicted_cr & old_method_rejected
+
+    for integration in np.where(cnn_only)[0]:
+        axes[integration].axhspan(0, n_spa, color=color_dict["cyan"], linewidth=0, alpha=0.5)
+
+    for integration in np.where(old_only)[0]:
+        axes[integration].axhspan(0, n_spa, color='red', linewidth=0, alpha=0.3)
+
+    for integration in np.where(both)[0]:
+        axes[integration].axhspan(0, n_spa, color=color_dict["green"], linewidth=0, alpha=0.5)
+
+    # Scan-level indicator: at least one CR rejection from either method
+    check=int(np.any(predicted_cr | old_method_rejected))
+
+    return flags, check, cr_rejected
 
 
 def cosmic_ray_filtering_fuv(axes):
@@ -375,25 +783,94 @@ def cosmic_ray_filtering_fuv(axes):
     return flags
 
 
-def positive_spectra(axes, flag_array, plot_color):
-    # find passing pixels
+def positive_spectra(axes, flag_array, mlr_coeff, cr_probabilities=None):
+    """Mark passing pixels and label each integration with CNN CR probability."""
+
+    probabilities = None
+    if cr_probabilities is not None:
+        probabilities = np.asarray(cr_probabilities).reshape(-1)
+
+        if len(probabilities) != len(axes):
+            raise ValueError(
+                f"Received {len(probabilities)} CR probabilities, "
+                f"but there are {len(axes)} detector-image axes."
+            )
+
+    # Find passing pixels
     good_ind = np.squeeze(np.where(flag_array == 1))
 
-    # show positive detections on detector images
-    if np.isscalar(good_ind[0]):
+    if good_ind.size == 0:
+        good_int = np.array([], dtype=int)
+        good_spa = np.array([], dtype=int)
+
+    elif good_ind.ndim == 1:
         good_int = np.array([good_ind[0]])
         good_spa = np.array([good_ind[1]])
+
     else:
         good_int = good_ind[0]
         good_spa = good_ind[1]
-    unique_ints = np.unique(good_int)
-    for integration in unique_ints:
-        axis = axes[integration]
-        yticks = good_spa[np.where(good_int == integration)[0]] + 0.5
-        axis.set_yticks(yticks)
-        axis.set_yticklabels([])
-        axis.text(1.01, 0.5, integration + 1, ha='left', va='center', fontsize=8, fontweight='bold', color=plot_color,
-                  transform=axis.transAxes)
+
+    unique_good_ints = np.unique(good_int)
+
+    for integration, axis in enumerate(axes):
+        # Put tick marks on the left only for spatial bins that passed.
+        if integration in unique_good_ints:
+            integration_spatial_bins = good_spa[good_int == integration]
+            yticks = integration_spatial_bins + 0.5
+            
+
+            axis.set_yticks(yticks)
+            axis.set_yticklabels([])
+
+        # Integration number
+        integration_label = f"{integration + 1}"
+        solar_coeff=mlr_coeff[integration] if mlr_coeff is not None else np.nan
+
+        # Add CNN probability when supplied
+        if probabilities is not None:
+            if np.isfinite(probabilities[integration]):
+                probability_label = f"{probabilities[integration]:.2f}"
+            else:
+                probability_label = "N/A"
+            chisq_value = np.nanmax(chisq[integration, :])
+            const_value = np.nanmax(const[integration, :])
+            label = f"{integration_label} {chisq_value/threshold_chisq:.1f} {const_value/threshold_const:.1f} {solar_coeff:.0f} {probability_label}"
+        else:
+            label = integration_label
+
+        cnn_bad = (probabilities is not None and probabilities[integration] >= CR_THRESHOLD)
+        baseline_bad = np.any(const[integration, :] > threshold_const)
+        chisq_bad = np.any(chisq[integration, :] > threshold_chisq)
+        solar_bad = solar_coeff > 100
+        old_method_bad = baseline_bad or chisq_bad or solar_bad
+
+        # Highlight CNN-positive integrations in cyan, Chi-sq positive in red, and both in green
+        if cnn_bad and old_method_bad:
+            label_color = color_dict["green"]
+            fontweight = "bold"
+        elif cnn_bad:
+            label_color = color_dict["cyan"]
+            fontweight = "bold"
+        elif old_method_bad:
+            label_color = "red"
+            fontweight = "bold"
+        else:
+            label_color = "white"
+            fontweight = "normal"
+
+        axis.text(
+            1.01,
+            0.5,
+            label,
+            ha="left",
+            va="center",
+            fontsize=7,
+            fontweight=fontweight,
+            color=label_color,
+            transform=axis.transAxes,
+            clip_on=False,
+        )
 
 
 # function to calculate the MLR coefficient in DN space from the calibrated MLR value
@@ -441,7 +918,7 @@ def plot_average_spectrum(axis, flag_array):
     axis.plot(plot_wavelength, aurora_spectrum, color=color_dict['red'], linestyle='--', linewidth=0.5)
 
     # return the wavelength and spectra
-    return plot_wavelength, background_spectrum, aurora_spectrum
+    return plot_wavelength, background_spectrum, aurora_spectrum, solar_coeff, co_coeff
 
 
 def plot_average_spectrum_fuv(axis, flag_array):
@@ -755,7 +1232,7 @@ def avg_unc(unc_arr, count):
     return np.sqrt(np.sum(unc_arr ** 2)) / count
 
 
-def short_csv():
+def short_csv(csv_path):
     good_ind = np.squeeze(np.where(flag == 1))
     if np.isscalar(good_ind[0]):
         good_int = np.array([good_ind[0]])
@@ -849,17 +1326,23 @@ def short_csv():
         'r_square_muv': [r_square],
         'pearson_r_muv': [pearson_r],
         'pearson_r_fuv': [np.nan],
+        'spatial_x': [rms_x_reg],
+        'spatial_y': [rms_y_reg],
         'color_flag_muv': [color_flag],
         'color_flag_fuv': ['red'],
         'cosmic_ray_check_muv': [manual_check],
         'discrete': [discrete]
     }
-    output_df = pd.DataFrame.from_dict(data=data_dict, orient='columns')
-    if not block_csv_path.exists():
-        output_df.to_csv(block_csv_path, header=True, index=False)
-    else:
-        output_df.to_csv(block_csv_path, mode='a', header=False, index=False)
+    df = pd.DataFrame.from_dict(data=data_dict, orient="columns")
 
+    file_exists = csv_path.exists()
+
+    df.to_csv(
+        csv_path,
+        mode="a" if file_exists else "w",
+        header=not file_exists,
+        index=False,
+    )
 def discrete_csv():
     good_ind = np.squeeze(np.where(flag == 1))
     if np.isscalar(good_ind[0]):
@@ -1169,8 +1652,13 @@ o1304_cmap = H_colormap()
 o1356_cmap = H_colormap()
 
 # load SPICE kernels
-load_iuvs_spice(spice_directory='D:/periapse_quicklooks/spice')
+load_iuvs_spice(spice_directory='E:/periapse_quicklooks/spice')
 print('SPICE kernels loaded')
+
+# Load the CNN and its reference wavelength grid once, not inside the scan loop.
+cr_model = tf.keras.models.load_model(CR_MODEL_FILE)
+cr_target_wavelength = get_reference_wavelength()
+print(f"Cosmic-ray CNN loaded: {CR_MODEL_FILE}")
 
 # remove existing files
 #os.system('rm *%s.csv' % version)
@@ -1186,8 +1674,9 @@ diffuse_aurora = np.concatenate((december2014, march2015, september2017))
 possible_diffuse = np.concatenate((np.arange(2508, 2517 + 1), np.arange(3338, 3546 + 1), np.arange(4556, 4567 + 1),
                                    [6753, 4736, 3828]))
 
-# Process the requested range one orbit block at a time.
+# get orbit numbers
 for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
+
     block_end = min(block_start + BLOCK_SIZE, RUN_END)
 
     block_start_str = format_orbit(block_start)
@@ -1198,26 +1687,41 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
     print(f"Processing orbit block {block_start}-{block_end - 1}")
     print("=" * 70)
 
+    # One CSV for this entire block.
     block_csv_path = (
         TABLE_OUTPUT_DIR
-        / f"{block_start_str}_{block_end_str}_detections_short_{version}.csv"
+        / f"{block_start_str}_{block_end_str}_detections_short_cnn.csv"
     )
 
-    # Remove old output so detections from previous runs aren't retained
     if block_csv_path.exists():
         block_csv_path.unlink()
 
-
+    # One quicklook directory for this block.
     block_quicklook_dir = QUICKLOOK_OUTPUT_DIR / block_start_str
-    block_spectra_dir = SPECTRA_OUTPUT_DIR / block_start_str
     block_quicklook_dir.mkdir(parents=True, exist_ok=True)
+
+    # Optionally place spectra into matching 100-orbit directories too.
+    block_spectra_dir = SPECTRA_OUTPUT_DIR / block_start_str
     block_spectra_dir.mkdir(parents=True, exist_ok=True)
 
     orbit_numbers = np.arange(block_start, block_end)
+
+    # Use a new timer for each block.
     block_t0 = time.time()
 
     for i, orbit_number in enumerate(orbit_numbers):
-        progress_report(block_t0, i, orbit_number, len(orbit_numbers))
+
+        progress_report(
+            block_t0,
+            i,
+            orbit_number,
+            len(orbit_numbers),
+        )
+
+        # Everything currently inside your orbit loop goes here.
+        #orbit_number = 14408
+        # print progress report
+
         # list to hold flags
         master_flags_list = []
 
@@ -1241,6 +1745,7 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         sza = hdull1c['pixelgeometry'].data['pixel_solar_zenith_angle']
         if np.nanmax(sza) < 112:
             print('No pixels above SZA threshold for orbit %i' % orbit_number)
+            hdull1c.close()
             continue
 
         # variable to hold whether or not any pixels pass
@@ -1249,25 +1754,99 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         # determine number of scans and integrations
         n_scans, n_int, n_spa, n_spec = get_dims(hdull1c)
 
+        matched_l1bfiles = build_l1b_scan_mapping(l1bfiles, hdull1c)
+
         if len(l1bfiles) < n_scans:
-                    print(
-                        f"Skipping orbit {orbit_number}: "
-                        f"expected {n_scans} L1B files, found {len(l1bfiles)}"
-                    )
-                    hdull1c.close()
-                    continue
+            print(
+                f"Skipping orbit {orbit_number}: "
+                f"expected {n_scans} L1B files, found {len(l1bfiles)}"
+            )
+            hdull1c.close()
+            continue
+
+        # Predict every integration in this orbit once. The reshape order matches
+        # scan-major/integration-minor ordering used during CNN training.
+        cr_X, cr_valid = build_cnn_orbit_input(
+            hdull1c,
+            cr_target_wavelength
+        )
+
+        # NaN means the CNN did not evaluate this integration.
+        cr_probabilities_flat = np.full(
+            len(cr_valid),
+            np.nan,
+            dtype=float
+        )
+
+        # Only send valid integrations through the CNN.
+        if np.any(cr_valid):
+            cr_probabilities_flat[cr_valid] = (
+                cr_model.predict(
+                    cr_X[cr_valid],
+                    verbose=0
+                ).reshape(-1)
+            )
+
+        # Restore (scan, integration) shape.
+        cr_probabilities = cr_probabilities_flat.reshape(
+            n_scans,
+            n_int
+        )
+
+        # NaN probabilities evaluate False here, so the CNN abstains rather
+        # than rejecting integrations it could not evaluate.
+        cr_predictions = cr_probabilities >= CR_THRESHOLD
+
+        print(
+            f"CNN cosmic rays: {np.count_nonzero(cr_predictions)} / "
+            f"{np.count_nonzero(cr_valid)} valid integrations "
+            f"at threshold {CR_THRESHOLD:.2f}"
+        )
+
+        # Diagnostic: show which integrations were skipped by the CNN.
+        for scan_index in range(n_scans):
+            bad_ints = np.where(
+                ~np.isfinite(cr_probabilities[scan_index])
+            )[0]
+
+            if len(bad_ints) > 0:
+                print(
+                    f"Orbit {orbit_number}, scan {scan_index + 1}: "
+                    f"CNN skipped integrations {(bad_ints + 1).tolist()}"
+                )
 
         # calculate number of rows for detector images (6 per row)
         det_rows = int(np.ceil(n_scans / 6))
 
-        # get time of periapsis and convert to string
-        altitude = hdull1c['pixelgeometry'].data['pixel_corner_mrh_alt'][:, 3, 4, :]
-        peri_ind = np.where(altitude == np.nanmin(altitude))
-        utc = hdull1c['integration'].data['utc'][peri_ind][0]
-        date = datetime.strptime(utc, '%Y/%j %b %d %H:%M:%S.%fUTC')
-        date_string = datetime.strftime(date, '%Y-%b-%d, %H:%M:%S UTC')
-        sub_solar_lat = hdull1c['spacecraftgeometry'].data['sub_solar_lat'][peri_ind][0]
-        sub_solar_lon = hdull1c['spacecraftgeometry'].data['sub_solar_lon'][peri_ind][0]
+        # Get time of periapsis using spacecraft altitude
+        sc_alt_all = hdull1c['spacecraftgeometry'].data['spacecraft_alt']
+
+        if not np.any(np.isfinite(sc_alt_all)):
+            print(f"Skipping orbit {orbit_number}: no valid spacecraft altitudes")
+            hdull1c.close()
+            continue
+
+        # Find minimum spacecraft altitude
+        peri_ind = np.unravel_index(
+            np.nanargmin(sc_alt_all),
+            sc_alt_all.shape
+        )
+
+        # Get UTC and solar coordinates
+        utc = hdull1c['integration'].data['utc'][peri_ind]
+
+        date = datetime.strptime(
+            utc,
+            '%Y/%j %b %d %H:%M:%S.%fUTC'
+        )
+
+        date_string = datetime.strftime(
+            date,
+            '%Y-%b-%d, %H:%M:%S UTC'
+        )
+
+        sub_solar_lat = hdull1c['spacecraftgeometry'].data['sub_solar_lat'][peri_ind]
+        sub_solar_lon = hdull1c['spacecraftgeometry'].data['sub_solar_lon'][peri_ind]
 
         # make a figure
         fig_width = 20.25
@@ -1277,7 +1856,7 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
 
         # make scan axis for CO Cameron Bands
         scan_axis_co = plt.axes([7.5 / fig_width, (0.5 + det_offset + 2.375 * 2) / fig_height, 5.5 / fig_width,
-                                 2.125 / fig_height])
+                                2.125 / fig_height])
         scan_axis_co.set_title('Orbit %i, %s' % (orbit_number, date_string), fontsize=15, fontweight='bold')
         scan_axis_co.set_ylabel('Altitude [km]')
         scan_axis_co.set_xticks(np.arange(0.5, n_scans, 1))
@@ -1287,7 +1866,7 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         [scan_axis_co.axvline(i, color=color_dict['darkgrey'], zorder=0, linewidth=0.5) for i in range(n_scans)]
         cax_co = plt.axes(
             [(6.875 + 6.25) / fig_width, (0.5 + det_offset + 2.375 * 2) / fig_height, 0.125 / fig_width,
-             2.125 / fig_height])
+            2.125 / fig_height])
         co_sm = plt.cm.ScalarMappable(cmap=CO_colormap(), norm=norm_co)
         co_sm.set_array(np.array([]))
         cbar_co = plt.colorbar(co_sm, cax=cax_co, label='CO Cameron Band Radiance [kR]')
@@ -1297,7 +1876,7 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
 
         # make scan axis for CO2+ UVD
         scan_axis_co2p = plt.axes([7.5 / fig_width, (0.5 + det_offset + 2.375) / fig_height, 5.5 / fig_width,
-                                   2.125 / fig_height])
+                                2.125 / fig_height])
         scan_axis_co2p.set_ylabel('Altitude [km]')
         scan_axis_co2p.set_xticks(np.arange(0.5, n_scans, 1))
         scan_axis_co2p.set_xticklabels([])
@@ -1306,7 +1885,7 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         [scan_axis_co2p.axvline(i, color=color_dict['darkgrey'], zorder=0, linewidth=0.5) for i in range(n_scans)]
         cax_co2p = plt.axes(
             [(6.875 + 6.25) / fig_width, (0.5 + det_offset + 2.375) / fig_height, 0.125 / fig_width,
-             2.125 / fig_height])
+            2.125 / fig_height])
         co2p_sm = plt.cm.ScalarMappable(cmap=CO2p_colormap(), norm=norm_co2p)
         co2p_sm.set_array(np.array([]))
         cbar_co2p = plt.colorbar(co2p_sm, cax=cax_co2p, label=r'CO$_2^+$ UVD Radiance [kR]')
@@ -1320,7 +1899,12 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         scan_axis_solar.set_xlabel(r'Average Scan Solar Zenith Angle [$\degree$]')
         scan_axis_solar.set_xticks(np.arange(0.5, n_scans, 1))
         sza = hdull1c['pixelgeometry'].data['pixel_solar_zenith_angle']
-        xlabels = ['%i' % i for i in np.nanmean(np.nanmean(sza, axis=1), axis=1)]
+        mean_sza = np.nanmean(sza, axis=(1, 2))
+
+        xlabels = [
+            f"{value:.0f}" if np.isfinite(value) else "N/A"
+            for value in mean_sza
+        ]
         scan_axis_solar.set_xticklabels(xlabels)
         scan_axis_solar.set_xlim(0, n_scans)
         scan_axis_solar.set_ylabel('Altitude [km]')
@@ -1369,28 +1953,28 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         # draw terminator
         terminator_lon, terminator_lat, terminator = calc_sza(sub_solar_lat, sub_solar_lon)
         cf = map_axis.contourf(terminator_lon, terminator_lat, terminator, levels=[0, 90],
-                               colors=color_dict['darkgrey'], alpha=0.33)
+                            colors=color_dict['darkgrey'], alpha=0.33)
         cs = map_axis.contour(terminator_lon, terminator_lat, terminator, levels=[90, 102], colors=color_dict['grey'])
         map_axis.clabel(cs, inline=1, fontsize=8, fmt=r'$%i\degree$')
 
         # place map axis legend
         legend_elements = [Line2D([0], [0], marker='.', markersize=10, markeredgecolor='none', linewidth=0,
-                                  color=color_dict['green'], label='IUVS Confirmed Detection'),
-                           Line2D([0], [0], marker='.', markersize=10, markeredgecolor='none', linewidth=0,
-                                  color=color_dict['yellow'], label='IUVS Marginal Detection'),
-                           Line2D([0], [0], marker='.', markersize=10, markeredgecolor='none', linewidth=0.5,
-                                  color='white', label='MAVEN Position'),
-                           Line2D([0], [0], marker='.', markersize=10, linewidth=0, markeredgecolor='none',
-                                  color=color_dict['cyan'], label='Nearside 135 km Altitude Intercept'),
-                           Line2D([0], [0], marker='.', markersize=10, linewidth=0, markeredgecolor='none',
-                                  color=color_dict['violet'], label='Farside 135 km Altitude Intercept'),
-                           ]
+                                color=color_dict['green'], label='IUVS Confirmed Detection'),
+                        Line2D([0], [0], marker='.', markersize=10, markeredgecolor='none', linewidth=0,
+                                color=color_dict['yellow'], label='IUVS Marginal Detection'),
+                        Line2D([0], [0], marker='.', markersize=10, markeredgecolor='none', linewidth=0.5,
+                                color='white', label='MAVEN Position'),
+                        Line2D([0], [0], marker='.', markersize=10, linewidth=0, markeredgecolor='none',
+                                color=color_dict['cyan'], label='Nearside 135 km Altitude Intercept'),
+                        Line2D([0], [0], marker='.', markersize=10, linewidth=0, markeredgecolor='none',
+                                color=color_dict['violet'], label='Farside 135 km Altitude Intercept'),
+                        ]
         leg_map = map_axis.legend(handles=legend_elements, edgecolor='white', fancybox=False, framealpha=1)
         leg_map.get_frame().set_linewidth(0.5)
 
         # make s/c altitude axis
         alt_dist_axis = plt.axes([0.5 / fig_width, (0.5 + det_offset + 4.125 + 0.375) / fig_height, 5.75 / fig_width,
-                                  2.375 / fig_height])
+                                2.375 / fig_height])
         alt_dist_axis.xaxis.set_major_locator(ticker.MultipleLocator(base=1))
         alt_dist_axis.xaxis.set_minor_locator(ticker.MultipleLocator(base=1 / n_int))
         alt_dist_axis.yaxis.set_major_locator(ticker.MultipleLocator(base=50))
@@ -1414,16 +1998,16 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
 
         # place altitude/tangent distance axis legend
         legend_elements = [Line2D([0], [0], marker='.', markersize=4, linewidth=0.5,
-                                  color='white', label='MAVEN Spacecraft Altitude'),
-                           Line2D([0], [0], marker='.', markersize=4, linewidth=0,
-                                  color=color_dict['green'], label='Statitical Detections Altitude'),
-                           Line2D([0], [0], linewidth=0.5, color=color_dict['grey'], label='Tangent Point Distance'),
-                           Line2D([0], [0], linewidth=0.5, color=color_dict['red'], linestyle='--', label='Periapsis'),
-                           Line2D([0], [0], linewidth=0.5, color=color_dict['grey'], linestyle=':',
-                                  label='135 km Altitude')
-                           ]
+                                color='white', label='MAVEN Spacecraft Altitude'),
+                        Line2D([0], [0], marker='.', markersize=4, linewidth=0,
+                                color=color_dict['green'], label='Statitical Detections Altitude'),
+                        Line2D([0], [0], linewidth=0.5, color=color_dict['grey'], label='Tangent Point Distance'),
+                        Line2D([0], [0], linewidth=0.5, color=color_dict['red'], linestyle='--', label='Periapsis'),
+                        Line2D([0], [0], linewidth=0.5, color=color_dict['grey'], linestyle=':',
+                                label='135 km Altitude')
+                        ]
         leg_alt = tangent_dist_ax.legend(handles=legend_elements, ncol=2, edgecolor='white', fancybox=False,
-                                         framealpha=1)
+                                        framealpha=1)
         leg_alt.get_frame().set_linewidth(0.5)
 
         # make spectrum axes
@@ -1433,7 +2017,7 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
             for col in range(2):
                 ax = plt.axes(
                     [(14 + 2.925 * col) / fig_width, (0.5 + row * (6.875 / n_rows) + det_offset) / fig_height,
-                     2.75 / fig_width, 6.875 / n_rows / fig_height])
+                    2.75 / fig_width, 6.875 / n_rows / fig_height])
                 ax.set_xticks([])
                 ax.set_yticks([])
                 spectrum_axes[col].append(ax)
@@ -1447,18 +2031,18 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
                 for inte in range(n_int):
                     x0 = (0.5 + ((fig_width - 0.5) / 6) * col)
                     y0 = 0.5 * (row + 1) + 0.125 * n_int * row + 0.125 * inte
-                    xw = 19.25 / 6 - 0.5
+                    xw = 19.25 / 6 - 0.75
                     yw = 0.1
                     ax = plt.axes([x0 / fig_width, y0 / fig_height, xw / fig_width, yw / fig_height])
                     ax.tick_params(which='minor', axis='x', bottom=True, top=True, labeltop=False, labelbottom=False)
                     if inte == 0:
                         ax.set_xticks(peaks)
                         ax.tick_params(which='major', axis='x', bottom=True, top=False, labeltop=False,
-                                       labelbottom=False)
+                                    labelbottom=False)
                     elif inte == n_int - 1:
                         ax.set_xticks(peaks)
                         ax.tick_params(which='major', axis='x', bottom=False, top=True, labeltop=False,
-                                       labelbottom=False)
+                                    labelbottom=False)
                     else:
                         ax.set_xticks([])
                         ax.set_xticks(peaks, minor=True)
@@ -1469,45 +2053,26 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         # get feature indices
         try:
             solar_ind, co_ind, co2puvd_ind, o2972_ind, no_nightglow_ind, o1304_ind, o1356_ind = get_feature_indices(hdull1c)
-        except IndexError:
-            print('broken')
-            print(get_feature_indices(hdull1c))
+        except:
+            print('No nightglow feature found for orbit %i' % orbit_number)
+            continue
 
         # calculate periapse distance and starting coordinates
-        periapse_distance, lat0, lon0 = calculate_periapse_distance(hdull1c, R_Mars_km)
+        try:
+            periapse_distance, lat0, lon0 = calculate_periapse_distance(
+                hdull1c, R_Mars_km
+            )
+        except ValueError as e:
+            print(f"Skipping orbit {orbit_number}: {e}")
+            plt.close(fig)
+            hdull1c.close()
+            continue
 
         # calculate constant and chi-square thresholds for this orbit
         const = hdull1c['radiance_noaltbin'].data['baseline_muv']
         chisq = hdull1c['radiance_noaltbin'].data['chi_square_muv']
         threshold_const = np.nanmean(const) + np.nanstd(const)
         threshold_chisq = np.nanmedian(chisq) + 2 * np.nanstd(chisq)
-
-        # load MLR templates
-        if n_spec == 219:
-            load_spec = 256
-        else:
-            load_spec = n_spec
-        templates = np.load('PyUVS/ancillary/templates_%i.npy' % load_spec, allow_pickle=True)
-        # noinspection PyUnresolvedReferences
-        template_wavelength = templates.item().get('wavelength')
-        dwavelength = np.diff(template_wavelength)[0]
-        # noinspection PyUnresolvedReferences
-        template_solar_continuum = templates.item().get('solar_continuum')
-        # noinspection PyUnresolvedReferences
-        template_co_cameron = templates.item().get('co_cameron')
-        # noinspection PyUnresolvedReferences
-        template_co2p_uvd = templates.item().get('co2p_uvd')
-        # noinspection PyUnresolvedReferences
-        template_no_nightglow = templates.item().get('no_nightglow')
-
-        # account for 219 spectral bins
-        if n_spec == 219:
-            start = 6
-            template_wavelength = template_wavelength[start:start + n_spec]
-            template_solar_continuum = template_solar_continuum[start:start + n_spec]
-            template_co_cameron = template_co_cameron[start:start + n_spec]
-            template_co2p_uvd = template_co2p_uvd[start:start + n_spec]
-            template_no_nightglow = template_no_nightglow[start:start + n_spec]
 
         # scaling factors
         co_cameron_scale = 1.0
@@ -1522,7 +2087,8 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
         for scan in range(n_scans):
 
             # load level 1B file
-            hdull1b = fits.open(l1bfiles[scan], ignore_missing_simple=True, ignore_missing_end=True)
+            #hdull1b = fits.open(l1bfiles[scan], ignore_missing_simple=True, ignore_missing_end=True)
+            hdull1b = fits.open(matched_l1bfiles[scan], ignore_missing_simple=True, ignore_missing_end=True)
             #try:
                 #hdull1b = fits.open(l1bfiles[scan], ignore_missing_simple=True)
             #except OSError:
@@ -1576,13 +2142,55 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
             wavelength = np.squeeze(hdull1b['observation'].data['wavelength'])
             spectra = hdull1b['detector_dark_subtracted'].data
 
+            # Number of spectral bins for THIS L1B scan
+            scan_n_spec = spectra.shape[-1]
+
+            # Load matching MLR templates
+            if scan_n_spec == 219:
+                load_spec = 256
+            else:
+                load_spec = scan_n_spec
+
+            templates = np.load(
+                f'PyUVS/ancillary/templates_{load_spec}.npy',
+                allow_pickle=True
+            ).item()
+
+            template_wavelength = templates['wavelength']
+            template_solar_continuum = templates['solar_continuum']
+            template_co_cameron = templates['co_cameron']
+            template_co2p_uvd = templates['co2p_uvd']
+            template_no_nightglow = templates['no_nightglow']
+
+            # Convert 256-bin templates to the 219-bin configuration
+            if scan_n_spec == 219:
+                start = 6
+
+                template_wavelength = template_wavelength[
+                    start:start + scan_n_spec
+                ]
+                template_solar_continuum = template_solar_continuum[
+                    start:start + scan_n_spec
+                ]
+                template_co_cameron = template_co_cameron[
+                    start:start + scan_n_spec
+                ]
+                template_co2p_uvd = template_co2p_uvd[
+                    start:start + scan_n_spec
+                ]
+                template_no_nightglow = template_no_nightglow[
+                    start:start + scan_n_spec
+                ]
+
+            dwavelength = np.diff(template_wavelength)[0]
+
             # get calibration curve
             calibration_curve = calculate_calibration_curve(hdull1b)
 
             # place the level 1C Cameron band data in the physical axis
             latitude_wall, longitude_wall, altitude_wall = place_scan_image_physical(physical_axis, periapse_distance,
-                                                                                     lat0, lon0, co_cameron_radiance,
-                                                                                     CO_colormap(), norm=norm_co)
+                                                                                    lat0, lon0, co_cameron_radiance,
+                                                                                    CO_colormap(), norm=norm_co)
             latitude_wall = np.degrees(latitude_wall)
             longitude_wall = np.degrees(longitude_wall)
             longitude_wall[np.where(longitude_wall < 0)] += 360
@@ -1595,21 +2203,31 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
             # plot spacecraft position
             plot_spacecraft_position(map_axis, sc_lat, sc_lon)
 
-            # filter out cosmic rays
-            flag, manual_check = cosmic_ray_filtering(detector_image_axes[scan])
+            # place detector images
+            place_detector_images(detector_image_axes[scan], wavelength, spectra)
+
+            # Calculate solar-continuum MLR coefficient for every pixel.
+            solar_coeff_all = get_coeff(solar_radiance, template_solar_continuum, dwavelength, calibration_curve[3, :])
+
+            # Reduce the spatial bins to one value per integration.
+            solar_coeff_per_integration = np.nanmax(solar_coeff_all, axis=1)
+
+            # Filter integrations using this scan's CNN probabilities.
+            flag, manual_check, cr_rejected = cosmic_ray_filtering_cnn(detector_image_axes[scan], cr_probabilities[scan])
+
+            # outline pixels which were rejected by the CR filtering
+            outline_cr_rejected_pixels([scan_axis_co, scan_axis_co2p], cr_rejected)
 
             # outline pixels which meet signal-to-noise criteria
-            flag = outline_pixels([scan_axis_co, scan_axis_co2p], flag)
+            flag, rms_x_reg, rms_y_reg = outline_pixels([scan_axis_co, scan_axis_co2p], flag)
 
             # store flags
             master_flags_list.append(flag)
 
-            # place detector images
-            place_detector_images(detector_image_axes[scan], wavelength, spectra)
 
             # plot average spectrum without solar and NO components
             ind1, ind0 = divmod(scan, n_rows)
-            avg_wavelength, avg_background, avg_aurora = plot_average_spectrum(spectrum_axes[ind0, ind1], flag)
+            avg_wavelength, avg_background, avg_aurora, solar_coeff, co_coeff = plot_average_spectrum(spectrum_axes[ind0, ind1], flag)
 
             # calculate goodness-of-fit
             r_square, pearson_r = calculate_correlation(spectrum_axes[ind0, ind1], avg_wavelength, avg_background,
@@ -1658,9 +2276,14 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
                     "anomalous": int(0)
                 })
 
+            # Calculate solar-continuum MLR coefficient for every pixel.
+            #solar_coeff_all = get_coeff(solar_radiance, template_solar_continuum, dwavelength, calibration_curve[3, :])
 
-            # mark spectra which pass on detector images
-            positive_spectra(detector_image_axes[scan], flag, color)
+            # Reduce the spatial bins to one value per integration.
+            #solar_coeff_per_integration = np.nanmax(solar_coeff_all, axis=1)
+
+            # mark spectra which pass on detector images, label CR probabilities
+            positive_spectra(detector_image_axes[scan], flag, solar_coeff_per_integration, cr_probabilities=cr_probabilities[scan])
 
             # place possible detection region
             if (color == '#FDB813') | (color == '#2CA02C'):
@@ -1671,13 +2294,14 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
 
             # plot tangent distance
             plot_tangent_distance()
-
+        
             # save the data
             if (color == '#FDB813') | (color == '#2CA02C'):
                 #full_csv()
-                short_csv()
+                short_csv(block_csv_path)
 
             # no need to continue if there weren't any good pixels
+            hdull1b.close()
             if not any_pixels:
                 print(f'No good pixels for scan {scan + 1}')
                 continue
@@ -1719,12 +2343,26 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
 
         # download spectra
         if collected_spectra:
-            np.savez(
-                block_spectra_dir / f"orbit{orbit_number:05d}_spectra.npz",
-                items=np.array(collected_spectra, dtype=object)
+            spectra_path = (
+                block_spectra_dir
+                / f"orbit{orbit_number:05d}_spectra.npz"
             )
 
-        orbit_str = f"{orbit_number:05d}"
-        plt.savefig(block_quicklook_dir / f"orbit{orbit_str}.pdf", dpi=60)
-        plt.close('all')
+            np.savez(
+                spectra_path,
+                items=np.array(collected_spectra, dtype=object),
+            )
+
+        orbit_str = format_orbit(orbit_number)
+
+        quicklook_path = block_quicklook_dir / f"orbit{orbit_str}.pdf"
+
+        fig.savefig(
+            quicklook_path,
+            dpi=60,
+            bbox_inches="tight",
+        )
+
+        plt.close(fig)
+        hdull1c.close()
         print('Done!')

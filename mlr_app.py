@@ -2,7 +2,9 @@ import numpy as np
 import pandas as pd
 from astropy.io import fits
 from collections import defaultdict
+from datetime import datetime
 import glob
+import os
 import re
 from PyUVS.data import calculate_calibration_curve
 from dash import Dash, dcc, html, Input, Output, State
@@ -15,7 +17,7 @@ def open_l1c(orbit_num):
     orbit_num0=orbit_num
     orbit_num=(orbit_num0//100)*100 #rounds down to nearest 100
 
-    path=f"D:/nightglow/c/{orbit_num:05d}"
+    path=f"E:/nightglow/c/{orbit_num:05d}"
     file_list=glob.glob(path+'/mvn_iuv_l1c_periapse-orbit**.fits.gz')
 
     orbit_groups=defaultdict(list)
@@ -32,7 +34,7 @@ def open_l1b(orbit_num):
     orbit_num0=orbit_num
     orbit_num=(orbit_num0//100)*100 #rounds down to nearest 100
 
-    path=f"D:/nightglow/b/{orbit_num:05d}"
+    path=f"E:/nightglow/b/{orbit_num:05d}"
     file_list=glob.glob(path+'/mvn_iuv_l1b_periapse-orbit**.fits.gz')
 
     orbit_groups=defaultdict(list)
@@ -44,6 +46,40 @@ def open_l1b(orbit_num):
             orbit_groups[orbit].append(file)
 
     return orbit_groups[orbit_num0]
+
+def build_l1b_scan_mapping(l1b_files, l1c_hdul):
+    """Map each L1C scan to the L1B file with the nearest start UTC."""
+    if not l1b_files:
+        raise ValueError("No L1B files were found for this orbit.")
+
+    utc_format = "%Y/%j %b %d %H:%M:%S.%fUTC"
+    l1b_times = []
+
+    for filepath in l1b_files:
+        with fits.open(filepath) as hdul:
+            utc = hdul["integration"].data["utc"][0]
+            l1b_times.append(
+                (filepath, datetime.strptime(utc, utc_format))
+            )
+
+    mapping = []
+    l1c_utc = l1c_hdul["integration"].data["utc"]
+
+    for scan_index in range(l1c_utc.shape[0]):
+        scan_time = datetime.strptime(l1c_utc[scan_index, 0], utc_format)
+        best_file, best_time = min(
+            l1b_times,
+            key=lambda item: abs((item[1] - scan_time).total_seconds()),
+        )
+        time_difference = abs((best_time - scan_time).total_seconds())
+        mapping.append(best_file)
+
+        print(
+            f"L1C scan {scan_index + 1} -> {os.path.basename(best_file)} "
+            f"(dt={time_difference:.3f} s)"
+        )
+
+    return mapping
 
 def get_dims(l1c_hdul):
     dimensions = l1c_hdul['spectrum_noaltbin'].data['muv'].shape
@@ -165,7 +201,7 @@ def build_spectrum(orbit_num, scan, integ):
     l1c_path = open_l1c(orbit_num)
     l1b_paths = open_l1b(orbit_num)
 
-    with fits.open(l1c_path) as hdull1c, fits.open(l1b_paths[scan_index]) as hdull1b:
+    with fits.open(l1c_path) as hdull1c:
         n_scans, n_int, n_spa, n_spec = get_dims(hdull1c)
 
         if not 1 <= scan <= n_scans:
@@ -178,16 +214,20 @@ def build_spectrum(orbit_num, scan, integ):
                 f"Integration must be between 1 and {n_int}; received {integ}."
             )
 
+        matched_l1b_paths = build_l1b_scan_mapping(l1b_paths, hdull1c)
+        matched_l1b_path = matched_l1b_paths[scan_index]
+
+        with fits.open(matched_l1b_path) as hdull1b:
+            # Calculate these for the time-matched L1B file.
+            calibration_curve = calculate_calibration_curve(hdull1b)
+            wavelength = np.squeeze(
+                hdull1b["observation"].data["wavelength"]
+            ).copy()
+            spectra = hdull1b["detector_dark_subtracted"].data.copy()
+
         # Select the requested integration for every spatial bin
         good_int = np.full(n_spa, integration_index, dtype=int)
         good_spa = np.arange(n_spa)
-
-        # Calculate these for the selected L1B file instead of relying on globals
-        calibration_curve = calculate_calibration_curve(hdull1b)
-        wavelength = np.squeeze(
-            hdull1b["observation"].data["wavelength"]
-        )
-        spectra = hdull1b["detector_dark_subtracted"].data
 
         const, threshold_const = get_l1c_baseline(
             hdull1c,
@@ -325,13 +365,29 @@ def build_spectrum(orbit_num, scan, integ):
         "background": background_spectrum,
         "threshold_constant": threshold_const,
         "constant_value": constant_value,
+        "l1b_path": matched_l1b_path,
     }
 
-def build_detector_image(orbit_num, scan, integ):
-    l1b_paths = open_l1b(orbit_num)
-    with fits.open(l1b_paths[scan - 1]) as hdull1b:
-        wavelength = np.squeeze(hdull1b["observation"].data["wavelength"])
-        spectra = hdull1b["detector_dark_subtracted"].data[integ - 1, :, :]
+def build_detector_image(orbit_num, scan, integ, l1b_path=None):
+    if l1b_path is None:
+        l1c_path = open_l1c(orbit_num)
+        l1b_paths = open_l1b(orbit_num)
+
+        with fits.open(l1c_path) as hdull1c:
+            n_scans, _, _, _ = get_dims(hdull1c)
+            if not 1 <= scan <= n_scans:
+                raise ValueError(
+                    f"Scan must be between 1 and {n_scans}; received {scan}."
+                )
+            l1b_path = build_l1b_scan_mapping(l1b_paths, hdull1c)[scan - 1]
+
+    with fits.open(l1b_path) as hdull1b:
+        wavelength = np.squeeze(
+            hdull1b["observation"].data["wavelength"]
+        ).copy()
+        spectra = hdull1b["detector_dark_subtracted"].data[
+            integ - 1, :, :
+        ].copy()
         log_spectra = np.log10(np.clip(spectra, 50, None))
         #detector_image = np.nanmean(spectra, axis=0)
     return wavelength, spectra, log_spectra
@@ -549,6 +605,7 @@ def update_spectrum(
             orbit_num,
             scan,
             integration,
+            spectrum_data["l1b_path"],
         )
 
     #If error, set figure to empty and print error

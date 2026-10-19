@@ -8,29 +8,52 @@ import re
 # SETTINGS
 # ============================================================
 
-orbit_start = 23000
-orbit_end = 23100
+orbit_start = 7300
+orbit_end = 7400
 drive_letter = "E"  # Change this to "D" if the files are on the D drive
 
-# Folder containing the detection CSV
-csv_folder = Path(f"{drive_letter}:/nightglow/tables_cnn")
+if drive_letter == "E":
+    # Folder containing the detection CSV
+    csv_folder = Path(f"{drive_letter}:/nightglow/tables_cnn")
 
-# Folder containing the orbit PDFs
-pdf_folder = Path(
-    f"{drive_letter}:/nightglow/quicklooks_out_cnn/{orbit_start:05d}"
-)
+    # Folder containing the orbit PDFs
+    pdf_folder = Path(
+        f"{drive_letter}:/nightglow/quicklooks_out_cnn/{orbit_start:05d}"
+    )
 
-# Input detection CSV
-csv_file = (
-    csv_folder
-    / f"{orbit_start:05d}_{orbit_end:05d}_detections_short_cnn.csv"
-)
+    # Input detection CSV
+    csv_file = (
+        csv_folder
+        / f"{orbit_start:05d}_{orbit_end:05d}_detections_short_cnn.csv"
+    )
 
-# Output PDF
-output_pdf = (
-    pdf_folder
-    / f"{orbit_start:05d}_{orbit_end:05d}_detections.pdf"
-)
+    # Output PDF
+    output_pdf = (
+        pdf_folder
+        / f"{orbit_start:05d}_{orbit_end:05d}_detections.pdf"
+    )
+
+else:
+    # Folder containing the detection CSV
+    csv_folder = Path(f"{drive_letter}:/nightglow/tables")
+
+    # Folder containing the orbit PDFs
+    pdf_folder = Path(
+        f"{drive_letter}:/nightglow/quicklooks_out/{orbit_start:05d}"
+    )
+
+    # Input detection CSV
+    csv_file = (
+        csv_folder
+        / f"{orbit_start:05d}_{orbit_end:05d}_detections_short_1.csv"
+    )
+
+    # Output PDF
+    output_pdf = (
+        pdf_folder
+        / f"{orbit_start:05d}_{orbit_end:05d}_detections.pdf"
+    )
+
 
 
 # ============================================================
@@ -39,6 +62,7 @@ output_pdf = (
 
 try:
     df = pd.read_csv(csv_file)
+    df = df[df["color_flag_muv"]!="yellow"]
 
 except FileNotFoundError:
     print(f"CSV file not found: {csv_file}\nMaybe no detections in this orbit range?")

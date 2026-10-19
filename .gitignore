@@ -1,28 +1,12 @@
-# Python
-__pycache__/
-*$py.class
-
-# Virtual environments
-.venv/
-venv/
-env/
 desktop/
 laptop/
+spice/
+periapse_quicklooks_clone/
+__pycache__/
 
-# VS Code settings
-.vscode/
+*.csv
 
-# Jupyter
-.ipynb_checkpoints/
-
-# macOS
-.DS_Store
-
-# Windows
-Thumbs.db
-
-# Misc
-/quicklooks_output
-/spice
-pdf_merger.py
-cr_labeling.py
+test.py
+limb_aurora_ql_CNN_ssd.py
+limb_aurora_ql_CNN_ssd_updated_v2.py
+limb_aurora_ql_CNN_ssd_updated_v3.py
