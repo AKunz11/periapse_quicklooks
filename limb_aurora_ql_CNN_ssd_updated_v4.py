@@ -1,3 +1,12 @@
+"""Generate MAVEN/IUVS periapse aurora quicklooks and detection tables.
+
+The script pairs Level 1B detector files with Level 1C retrievals, rejects
+cosmic-ray-contaminated integrations with a CNN, identifies candidate auroral
+pixels, and writes plots, summary tables, and averaged spectra.  Much of the
+plotting pipeline operates on the current orbit and scan through module-level
+state initialized in the processing loop near the end of this file.
+"""
+
 import glob
 import os
 import time
@@ -36,7 +45,7 @@ CR_MODEL_FILE = Path("cosmic_ray_model.keras")
 CR_THRESHOLD = 0.75
 CR_REFERENCE_ORBIT = 8212 # to get shape of data for building cnn cube
 
-#Helpful numbers
+# Orbit range and grouping used by the batch-processing loop below.
 RUN_START = 18700
 RUN_END = 18800  # exclusive, so the last orbit processed is 11999
 BLOCK_SIZE = 100    # run in 100 orbit blocks (e.g. 8600-8700, 8700-8800)
@@ -117,6 +126,8 @@ def orbit_block_start(orbit, block_size=100):
 
 # print progress report
 def progress_report(start_time, iterator, orbit, n_orbits):
+    """Print an in-place progress line with completion percentage and runtime."""
+
     current_time = time.time()
     seconds = current_time - start_time
     minutes, seconds = divmod(seconds, 60)
@@ -128,6 +139,8 @@ def progress_report(start_time, iterator, orbit, n_orbits):
 
 # function to return FITS files for levels 1B and 1C
 def get_fits(orbit, channel):
+    """Return sorted Level 1C and Level 1B files for an orbit and channel."""
+
     orbit_str = format_orbit(orbit)
      # Determine which 100-orbit folder contains this orbit.
     block_start = orbit_block_start(orbit, BLOCK_SIZE)
@@ -144,6 +157,8 @@ def get_fits(orbit, channel):
 
 
 def get_dims(l1c_hdul):
+    """Return scan, integration, spatial-bin, and spectral-bin dimensions."""
+
     dimensions = l1c_hdul['spectrum_noaltbin'].data['muv'].shape
     scans_count = dimensions[0]
     integration_count = dimensions[1]
@@ -153,12 +168,16 @@ def get_dims(l1c_hdul):
 
 
 def rearrange_dimensions(array):
+    """Reorder a geometry array to integration-by-spatial-bin orientation."""
+
     array = np.swapaxes(array, 1, 2)
     array = np.swapaxes(array, 0, 1)
     return array
 
 
 def get_feature_indices(l1c_hdul):
+    """Locate the required emission-feature columns in a Level 1C product."""
+
     features = l1c_hdul['emission_features'].data['emission']
     solar_index = np.where(features == 'Solar cont. muv')[0][0]
     co_index = np.where(features == 'CO Cameron')[0][0]
@@ -171,6 +190,12 @@ def get_feature_indices(l1c_hdul):
 
 
 def plot_spacecraft_altitude():
+    """Plot spacecraft altitude and mark periapsis on the shared altitude axis.
+
+    This helper uses the current ``n_scans``, ``n_int``, ``sc_alt``, and
+    ``alt_dist_axis`` values created by the main processing loop.
+    """
+
     x = np.arange(1, n_scans + 1, 1 / n_int)
     y = sc_alt.flatten()
     alt_dist_axis.plot(x, y, marker='.', ms=2, color='white', label='Spacecraft Altitude')
@@ -178,6 +203,12 @@ def plot_spacecraft_altitude():
 
 
 def plot_tangent_distance():
+    """Plot tangent-point distance for the current scan.
+
+    Geometry arrays and the destination axis are read from the current scan's
+    module-level processing state.
+    """
+
     x = np.arange(scan + 1, scan + 2, 1 / n_int)
     a = np.sin((latitude_rad[:, 3, 4] - sc_lat_rad) / 2) ** 2 + \
         np.cos(latitude_rad[:, 3, 4]) * np.cos(sc_lat_rad) * np.sin((longitude_rad[:, 3, 4] - sc_lon_rad) / 2) \
@@ -188,6 +219,8 @@ def plot_tangent_distance():
 
 
 def place_scan_image(axis, altitude_array, radiance, colormap, norm):
+    """Draw one scan's radiance pixels in scan-position/altitude coordinates."""
+
     for integration in range(n_int):
         for spatial_bin in range(n_spa):
             x_coordinates = [1 / 7 * (6 - spatial_bin) + scan, 1 / 7 * (6 - spatial_bin) + scan,
@@ -233,6 +266,13 @@ def outline_cr_rejected_pixels(axes, cr_rejected):
                 )
 
 def outline_pixels(axes, flags):
+    """Retain and outline nighttime pixels that meet the auroral SNR criteria.
+
+    The input flag array is updated in place.  The returned RMS values describe
+    the selected region in fractional-scan and altitude plot coordinates; a
+    one-pixel or empty region receives NaN RMS values.
+    """
+
     temp_flag = np.zeros_like(flags)
     coords = []
 
@@ -357,6 +397,22 @@ def outline_pixels(axes, flags):
 
 
 def calculate_periapse_distance(l1c_hdul, r):
+    """Calculate the first-scan reference point's distance from periapsis.
+
+    Parameters
+    ----------
+    l1c_hdul : astropy.io.fits.HDUList
+        Open Level 1C FITS product containing spacecraft and pixel geometry.
+    r : float
+        Reference planetary radius in kilometers.
+
+    Returns
+    -------
+    tuple
+        Along-surface periapse distance and reference latitude/longitude in
+        radians.
+    """
+
     sc_geom = l1c_hdul["spacecraftgeometry"].data
     pix_geom = l1c_hdul["pixelgeometry"].data
 
@@ -460,6 +516,12 @@ def calculate_periapse_distance(l1c_hdul, r):
 
 
 def place_scan_image_physical(axis, r_periapse, latitude_0, longitude_0, radiance, colormap, norm):
+    """Project and draw the current scan in along-track distance/altitude space.
+
+    Returns the recalculated latitude, longitude, and altitude arrays for each
+    pixel corner.  Current-scan geometry is taken from module-level state.
+    """
+
     # find where center element is closest to 135 km and get coordinates
     alt135 = altitude[:, 3, 4]
 
@@ -547,6 +609,8 @@ def place_scan_image_physical(axis, r_periapse, latitude_0, longitude_0, radianc
 
 
 def plot_spacecraft_position(axis, spacecraft_latitude, spacecraft_longitude):
+    """Plot the spacecraft ground track while handling the 0/360-degree seam."""
+
     spacecraft_longitude = spacecraft_longitude.flatten()
     spacecraft_latitude = spacecraft_latitude.flatten()
     if (len(np.where(spacecraft_longitude > 355)[0]) != 0) & (len(np.where(spacecraft_longitude < 5)[0]) != 0):
@@ -561,6 +625,8 @@ def plot_spacecraft_position(axis, spacecraft_latitude, spacecraft_longitude):
 
 
 def place_detector_images(axes, plot_wavelength, plot_spectra):
+    """Render detector spectra for every integration on a row of axes."""
+
     spec_cmap = plt.get_cmap('inferno')
     spec_cmap.set_bad((0, 0, 0))
 
@@ -764,6 +830,12 @@ def cosmic_ray_filtering_cnn(axes, probabilities):
 
 
 def cosmic_ray_filtering_fuv(axes):
+    """Apply the legacy FUV cosmic-ray and observing-geometry filters.
+
+    Returns a spatial flag array and a flag indicating whether manual review is
+    recommended.  The function uses fit metrics from the current scan.
+    """
+
     # make data flag array to hold locations of good data and variable to indicate manual checking
     flags = np.ones((n_int, n_spa))
 
@@ -875,10 +947,19 @@ def positive_spectra(axes, flag_array, mlr_coeff, cr_probabilities=None):
 
 # function to calculate the MLR coefficient in DN space from the calibrated MLR value
 def get_coeff(MLR, template_DN, dlambda, cal):
+    """Convert an MLR radiance into its calibrated template coefficient."""
+
     return MLR / (np.sum(template_DN / cal) * dlambda)
 
 
 def plot_average_spectrum(axis, flag_array):
+    """Plot the mean MUV spectrum and fitted components for selected pixels.
+
+    Returns the wavelength grid, background spectrum, auroral fit, and fitted
+    solar and CO coefficients.  Current Level 1B data and templates are read
+    from the scan-processing state.
+    """
+
     # find passing pixels
     good_ind = np.squeeze(np.where(flag_array == 1))
     if np.isscalar(good_ind[0]):
@@ -922,6 +1003,8 @@ def plot_average_spectrum(axis, flag_array):
 
 
 def plot_average_spectrum_fuv(axis, flag_array):
+    """Plot the mean FUV spectrum and fitted components for selected pixels."""
+
     # find passing pixels
     good_ind = np.squeeze(np.where(flag_array == 1))
     if np.isscalar(good_ind[0]):
@@ -1004,6 +1087,8 @@ def plot_average_spectrum_fuv(axis, flag_array):
 
 
 def calculate_correlation(axis, plot_wavelength, background_spectrum, aurora_spectrum):
+    """Calculate and annotate MUV R-squared and Pearson correlation metrics."""
+
     # calcualte quality of fit using only the bright Cameron band features
     minwave_ind = np.argmin(np.abs(plot_wavelength - 190))
     maxwave_ind = np.argmin(np.abs(plot_wavelength - 246))
@@ -1025,6 +1110,8 @@ def calculate_correlation(axis, plot_wavelength, background_spectrum, aurora_spe
 
 
 def calculate_correlation_fuv(axis, plot_wavelength, background_spectrum, aurora_spectrum):
+    """Calculate and annotate FUV R-squared and Pearson correlation metrics."""
+
     # calcualte quality of fit using only the bright Cameron band features
     minwave_ind = np.argmin(np.abs(plot_wavelength - (130.4 - 3)))
     maxwave_ind = np.argmin(np.abs(plot_wavelength - (135.6 + 3)))
@@ -1046,6 +1133,8 @@ def calculate_correlation_fuv(axis, plot_wavelength, background_spectrum, aurora
 
 
 def place_color_labels(axis, r2, r, flags):
+    """Classify a MUV detection, annotate its plots, and return mean radiances."""
+
     # determine color
     if np.isnan(r):
         plot_color = 'white'
@@ -1099,6 +1188,8 @@ def place_color_labels(axis, r2, r, flags):
 
 
 def place_color_labels_fuv(axis, r2, r, flags):
+    """Classify an FUV detection and annotate the current scan's plots."""
+
     # determine color
     if np.isnan(r):
         plot_color = 'white'
@@ -1148,6 +1239,11 @@ def place_color_labels_fuv(axis, r2, r, flags):
 
 
 def full_csv():
+    """Append one row per selected pixel to the legacy full detection CSV.
+
+    All values are collected from the current orbit and scan state.
+    """
+
     good_ind = np.squeeze(np.where(flag == 1))
     if np.isscalar(good_ind[0]):
         good_int = np.array([good_ind[0]])
@@ -1229,10 +1325,14 @@ def full_csv():
 
 
 def avg_unc(unc_arr, count):
+    """Return the uncertainty of a mean from independent uncertainties."""
+
     return np.sqrt(np.sum(unc_arr ** 2)) / count
 
 
 def short_csv(csv_path):
+    """Append one scan-level detection summary to ``csv_path``."""
+
     good_ind = np.squeeze(np.where(flag == 1))
     if np.isscalar(good_ind[0]):
         good_int = np.array([good_ind[0]])
@@ -1344,6 +1444,8 @@ def short_csv(csv_path):
         index=False,
     )
 def discrete_csv():
+    """Append selected pixels to the legacy discrete-detection CSV."""
+
     good_ind = np.squeeze(np.where(flag == 1))
     if np.isscalar(good_ind[0]):
         good_int = np.array([good_ind[0]])
@@ -1425,6 +1527,13 @@ def discrete_csv():
 
 
 def altitude_135(flags, color_string):
+    """Find and plot near- and far-side 135 km line-of-sight intercepts.
+
+    Parameters select the detector pixels and plotting color; spacecraft and
+    pixel geometry come from the current scan.  Four arrays containing the
+    near/far intercept latitudes and longitudes are returned in degrees.
+    """
+
     # line-of-sight parameters
     llos = 3000  # length of line-of-sight [km]
     dlos = 1  # sample spacing along line-of-sight [km]
@@ -1485,6 +1594,8 @@ def altitude_135(flags, color_string):
                 points = sorted(points, key=lambda point: point.x)
 
                 def get_intercept_coordinates(point):
+                    """Convert a line-of-sight intersection to Mars coordinates."""
+
                     idx = int(np.round(point.x))
                     idx = np.clip(idx, 0, n_los_samp - 1)
 
@@ -1607,12 +1718,16 @@ def altitude_135(flags, color_string):
 
 
 def haversine(latitude0, longitude0, lat1, lon1):
+    """Return great-circle angular separations for coordinates in radians."""
+
     angles = 2 * np.arcsin(np.sqrt(np.sin((latitude0 - lat1) / 2) ** 2 + np.cos(lat1) * np.cos(latitude0) *
                                    np.sin((longitude0 - lon1) / 2) ** 2))
     return angles
 
 
 def calc_sza(subsolar_latitude, subsolar_longitude):
+    """Build a global longitude/latitude grid and its solar zenith angles."""
+
     subsolar_latitude = np.radians(subsolar_latitude)
     subsolar_longitude = np.radians(subsolar_longitude)
     longitudes, latitudes = np.meshgrid(np.linspace(np.radians(0), np.radians(360), 3600),
@@ -1622,6 +1737,8 @@ def calc_sza(subsolar_latitude, subsolar_longitude):
 
 
 def point_distance(latitude0, longitude0, lat_arr, lon_arr):
+    """Return Mars surface distances from one point to coordinate arrays."""
+
     aa = abs(np.sin((lat_arr - latitude0) / 2) ** 2 +
              np.cos(lat_arr) * np.cos(longitude0) * np.sin((lon_arr - longitude0) / 2) ** 2)
     dd = 2 * np.arctan2(np.sqrt(aa), np.sqrt(1 - aa))
@@ -1629,7 +1746,9 @@ def point_distance(latitude0, longitude0, lat_arr, lon_arr):
     return ddist
 
 
-# set version number
+# Main batch pipeline.  The helpers above intentionally share the current
+# orbit/scan arrays created in this section.
+# Set version number used by legacy CSV filenames.
 version = '1'
 
 # filter warnings, there are a lot and they are annoying
