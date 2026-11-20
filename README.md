@@ -116,17 +116,19 @@ RUN_START = 18700
 RUN_END = 18800       # exclusive
 BLOCK_SIZE = 100
 
-BASE_L1C = Path("E:/nightglow/c")
-BASE_L1B = Path("E:/nightglow/b")
-TABLE_OUTPUT_DIR = Path("E:/nightglow/tables_cnn")
-QUICKLOOK_OUTPUT_DIR = Path("E:/nightglow/quicklooks_out_cnn")
-SPECTRA_OUTPUT_DIR = Path("E:/nightglow/spectra_out")
+BASE_L1C = Path("D:/nightglow/c_limb")
+BASE_L1B = Path("D:/nightglow/b_limb")
+TABLE_OUTPUT_DIR = Path("D:/nightglow/tables_cnn_limb") # output for the csv files
+QUICKLOOK_OUTPUT_DIR = Path("D:/nightglow/quicklooks_out_cnn_limb") # output for quicklook pdfs
+SPECTRA_OUTPUT_DIR = Path("D:/nightglow/spectra_out_limb") # output for spectra .npz files
+SPICE_DIR='D:/periapse_quicklooks/spice' # where u put the spice kernels
+LIMB_TYPE="outlimb" # periapse, inlimb, outlimb (apoapse is unsupported currently)
 ```
 
 Also update the SPICE path later in the file:
 
 ```python
-load_iuvs_spice(spice_directory="E:/periapse_quicklooks_updated/spice")
+load_iuvs_spice(spice_directory="D:/periapse_quicklooks_updated/spice")
 ```
 
 `CR_REFERENCE_ORBIT` must exist under `BASE_L1C`; its wavelength grid defines the CNN input grid. It can realistically be any l1c file, but safe to use the one that is in there by default. `RUN_END` is exclusive, so the example processes orbits 18700 through 18799.

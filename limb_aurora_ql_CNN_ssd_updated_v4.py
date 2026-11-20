@@ -56,12 +56,12 @@ TABLE_OUTPUT_DIR = Path("D:/nightglow/tables_cnn_limb") # output for the csv fil
 QUICKLOOK_OUTPUT_DIR = Path("D:/nightglow/quicklooks_out_cnn_limb") # output for quicklook pdfs
 SPECTRA_OUTPUT_DIR = Path("D:/nightglow/spectra_out_limb") # output for spectra .npz files
 SPICE_DIR='D:/periapse_quicklooks/spice' # where u put the spice kernels
+LIMB_TYPE="outlimb" # periapse, inlimb, outlimb (apoapse is werid currently)
 
 TABLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 QUICKLOOK_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SPECTRA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-LIMB_TYPE="outlimb" # periapse, inlimb, outlimb (apoapse is werid currently)
 
 def build_l1b_scan_mapping(l1bfiles, l1c_hdul):
     """Map each L1C scan to the L1B file with the nearest start UTC."""
