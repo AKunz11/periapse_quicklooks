@@ -1,11 +1,17 @@
 """Generate MAVEN/IUVS periapse aurora quicklooks and detection tables.
 
 The script pairs Level 1B detector files with Level 1C retrievals, rejects
-cosmic-ray-contaminated integrations with a CNN, identifies candidate auroral
+cosmic-ray-contaminated integrations with an optional CNN, identifies candidate auroral
 pixels, and writes plots, summary tables, and averaged spectra.  Much of the
 plotting pipeline operates on the current orbit and scan through module-level
 state initialized in the processing loop near the end of this file.
 """
+
+# Set False to use only the existing fit-metric and solar-angle filters.
+# TensorFlow and the CNN model/reference data are only needed when enabled.
+# CNN should only be used with the provided keras file from the github
+# or if you trained one on different type of data (e.g. inlimb/outlimb)
+USE_CNN = False
 
 import glob
 import os
@@ -20,7 +26,6 @@ import numpy as np
 import pandas as pd
 import sklearn.metrics as metrics
 import spiceypy as spice
-import tensorflow as tf
 from pathlib import Path
 from astropy.io import fits
 from matplotlib.lines import Line2D
@@ -34,31 +39,29 @@ from PyUVS.variables import R_Mars_km
 from PyUVS.data import calculate_calibration_curve
 from PyUVS.spice import load_iuvs_spice
 
-#TODO List
-# Run 7300 due to error
-# Error at 23956
-# Error at 14863
-
 
 # CNN cosmic-ray configuration
 CR_MODEL_FILE = Path("cosmic_ray_model.keras")
-CR_THRESHOLD = 0.75
+CR_THRESHOLD = 0.75 # confidence cutoff for a detection
 CR_REFERENCE_ORBIT = 8212 # to get shape of data for building cnn cube
 
 # Orbit range and grouping used by the batch-processing loop below.
-RUN_START = 18700
-RUN_END = 18800  # exclusive, so the last orbit processed is 11999
+RUN_START = 11000
+RUN_END = 14300  # exclusive, so the last orbit processed is xx999
 BLOCK_SIZE = 100    # run in 100 orbit blocks (e.g. 8600-8700, 8700-8800)
 
-BASE_L1C = Path("E:/nightglow/c")
-BASE_L1B = Path("E:/nightglow/b")
-TABLE_OUTPUT_DIR = Path("E:/nightglow/tables_cnn")
-QUICKLOOK_OUTPUT_DIR = Path("E:/nightglow/quicklooks_out_cnn")
-SPECTRA_OUTPUT_DIR = Path("E:/nightglow/spectra_out")
+BASE_L1C = Path("D:/nightglow/c_limb")
+BASE_L1B = Path("D:/nightglow/b_limb")
+TABLE_OUTPUT_DIR = Path("D:/nightglow/tables_cnn_limb") # output for the csv files
+QUICKLOOK_OUTPUT_DIR = Path("D:/nightglow/quicklooks_out_cnn_limb") # output for quicklook pdfs
+SPECTRA_OUTPUT_DIR = Path("D:/nightglow/spectra_out_limb") # output for spectra .npz files
+SPICE_DIR='D:/periapse_quicklooks/spice' # where u put the spice kernels
 
 TABLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 QUICKLOOK_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 SPECTRA_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+LIMB_TYPE="outlimb" # periapse, inlimb, outlimb (apoapse is werid currently)
 
 def build_l1b_scan_mapping(l1bfiles, l1c_hdul):
     """Map each L1C scan to the L1B file with the nearest start UTC."""
@@ -146,9 +149,9 @@ def get_fits(orbit, channel):
     block_start = orbit_block_start(orbit, BLOCK_SIZE)
     block_folder = format_orbit(block_start)
 
-    l1c_pattern = (BASE_L1C / block_folder / f"*periapse*orbit{orbit_str}*.gz")
+    l1c_pattern = (BASE_L1C / block_folder / f"*{LIMB_TYPE}*orbit{orbit_str}*.gz")
 
-    l1b_pattern = (BASE_L1B / block_folder / f"*periapse*orbit{orbit_str}-{channel}*.gz")
+    l1b_pattern = (BASE_L1B / block_folder / f"*{LIMB_TYPE}*orbit{orbit_str}-{channel}*.gz")
 
     l1c_files = sorted(glob.glob(str(l1c_pattern)))
     l1b_files = sorted(glob.glob(str(l1b_pattern)))
@@ -794,7 +797,8 @@ def cosmic_ray_filtering_cnn(axes, probabilities):
     baseline_bad_pixels=const > threshold_const
     chisq_bad_pixels=chisq > threshold_chisq
     low_sza_pixels=sza < 102
-    solar_bad=solar_coeff_per_integration > 100
+    # Solar-continuum rejection applies only to periapse observations.
+    solar_bad = (solar_coeff_per_integration > 100) if LIMB_TYPE == "periapse" else False
 
     baseline_bad=np.any(baseline_bad_pixels, axis=1)
     chisq_bad=np.any(chisq_bad_pixels, axis=1)
@@ -914,7 +918,7 @@ def positive_spectra(axes, flag_array, mlr_coeff, cr_probabilities=None):
         cnn_bad = (probabilities is not None and probabilities[integration] >= CR_THRESHOLD)
         baseline_bad = np.any(const[integration, :] > threshold_const)
         chisq_bad = np.any(chisq[integration, :] > threshold_chisq)
-        solar_bad = solar_coeff > 100
+        solar_bad = LIMB_TYPE == "periapse" and solar_coeff > 100
         old_method_bad = baseline_bad or chisq_bad or solar_bad
 
         # Highlight CNN-positive integrations in cyan, Chi-sq positive in red, and both in green
@@ -1771,13 +1775,18 @@ o1304_cmap = H_colormap()
 o1356_cmap = H_colormap()
 
 # load SPICE kernels
-load_iuvs_spice(spice_directory='E:/periapse_quicklooks/spice')
+load_iuvs_spice(SPICE_DIR)
 print('SPICE kernels loaded')
 
 # Load the CNN and its reference wavelength grid once, not inside the scan loop.
-cr_model = tf.keras.models.load_model(CR_MODEL_FILE)
-cr_target_wavelength = get_reference_wavelength()
-print(f"Cosmic-ray CNN loaded: {CR_MODEL_FILE}")
+if USE_CNN:
+    import tensorflow as tf
+
+    cr_model = tf.keras.models.load_model(CR_MODEL_FILE)
+    cr_target_wavelength = get_reference_wavelength()
+    print(f"Cosmic-ray CNN loaded: {CR_MODEL_FILE}")
+else:
+    print("Cosmic-ray CNN disabled; using existing fit-metric and solar-angle filters")
 
 # remove existing files
 #os.system('rm *%s.csv' % version)
@@ -1809,7 +1818,7 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
     # One CSV for this entire block.
     block_csv_path = (
         TABLE_OUTPUT_DIR
-        / f"{block_start_str}_{block_end_str}_detections_short_cnn.csv"
+        / f"{block_start_str}_{block_end_str}_detections_short_{LIMB_TYPE}.csv"
     )
 
     if block_csv_path.exists():
@@ -1883,56 +1892,59 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
             hdull1c.close()
             continue
 
-        # Predict every integration in this orbit once. The reshape order matches
-        # scan-major/integration-minor ordering used during CNN training.
-        cr_X, cr_valid = build_cnn_orbit_input(
-            hdull1c,
-            cr_target_wavelength
-        )
-
-        # NaN means the CNN did not evaluate this integration.
-        cr_probabilities_flat = np.full(
-            len(cr_valid),
-            np.nan,
-            dtype=float
-        )
-
-        # Only send valid integrations through the CNN.
-        if np.any(cr_valid):
-            cr_probabilities_flat[cr_valid] = (
-                cr_model.predict(
-                    cr_X[cr_valid],
-                    verbose=0
-                ).reshape(-1)
+        # NaN probabilities disable CNN rejection while retaining the other filters.
+        cr_probabilities = np.full((n_scans, n_int), np.nan, dtype=float)
+        if USE_CNN:
+            # Predict every integration in this orbit once. The reshape order matches
+            # scan-major/integration-minor ordering used during CNN training.
+            cr_X, cr_valid = build_cnn_orbit_input(
+                hdull1c,
+                cr_target_wavelength
             )
 
-        # Restore (scan, integration) shape.
-        cr_probabilities = cr_probabilities_flat.reshape(
-            n_scans,
-            n_int
-        )
+            # NaN means the CNN did not evaluate this integration.
+            cr_probabilities_flat = np.full(
+                len(cr_valid),
+                np.nan,
+                dtype=float
+            )
 
-        # NaN probabilities evaluate False here, so the CNN abstains rather
-        # than rejecting integrations it could not evaluate.
-        cr_predictions = cr_probabilities >= CR_THRESHOLD
-
-        print(
-            f"CNN cosmic rays: {np.count_nonzero(cr_predictions)} / "
-            f"{np.count_nonzero(cr_valid)} valid integrations "
-            f"at threshold {CR_THRESHOLD:.2f}"
-        )
-
-        # Diagnostic: show which integrations were skipped by the CNN.
-        for scan_index in range(n_scans):
-            bad_ints = np.where(
-                ~np.isfinite(cr_probabilities[scan_index])
-            )[0]
-
-            if len(bad_ints) > 0:
-                print(
-                    f"Orbit {orbit_number}, scan {scan_index + 1}: "
-                    f"CNN skipped integrations {(bad_ints + 1).tolist()}"
+            # Only send valid integrations through the CNN.
+            if np.any(cr_valid):
+                cr_probabilities_flat[cr_valid] = (
+                    cr_model.predict(
+                        cr_X[cr_valid],
+                        verbose=0
+                    ).reshape(-1)
                 )
+
+            # Restore (scan, integration) shape.
+            cr_probabilities = cr_probabilities_flat.reshape(
+                n_scans,
+                n_int
+            )
+
+            # NaN probabilities evaluate False here, so the CNN abstains rather
+            # than rejecting integrations it could not evaluate.
+            cr_predictions = cr_probabilities >= CR_THRESHOLD
+
+            print(
+                f"CNN cosmic rays: {np.count_nonzero(cr_predictions)} / "
+                f"{np.count_nonzero(cr_valid)} valid integrations "
+                f"at threshold {CR_THRESHOLD:.2f}"
+            )
+
+            # Diagnostic: show which integrations were skipped by the CNN.
+            for scan_index in range(n_scans):
+                bad_ints = np.where(
+                    ~np.isfinite(cr_probabilities[scan_index])
+                )[0]
+
+                if len(bad_ints) > 0:
+                    print(
+                        f"Orbit {orbit_number}, scan {scan_index + 1}: "
+                        f"CNN skipped integrations {(bad_ints + 1).tolist()}"
+                    )
 
         # calculate number of rows for detector images (6 per row)
         det_rows = int(np.ceil(n_scans / 6))
@@ -2474,7 +2486,7 @@ for block_start in range(RUN_START, RUN_END, BLOCK_SIZE):
 
         orbit_str = format_orbit(orbit_number)
 
-        quicklook_path = block_quicklook_dir / f"orbit{orbit_str}.pdf"
+        quicklook_path = block_quicklook_dir / f"orbit{orbit_str}_{LIMB_TYPE}.pdf"
 
         fig.savefig(
             quicklook_path,

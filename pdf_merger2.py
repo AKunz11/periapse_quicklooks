@@ -10,7 +10,7 @@ import re
 
 orbit_start = 7300
 orbit_end = 7400
-drive_letter = "E"  # Change this to "D" if the files are on the D drive
+drive_letter = "D"  # Change this to "D" if the files are on the D drive
 
 if drive_letter == "E":
     # Folder containing the detection CSV
@@ -35,17 +35,17 @@ if drive_letter == "E":
 
 else:
     # Folder containing the detection CSV
-    csv_folder = Path(f"{drive_letter}:/nightglow/tables")
+    csv_folder = Path(f"{drive_letter}:/nightglow/tables_cnn_limb")
 
     # Folder containing the orbit PDFs
     pdf_folder = Path(
-        f"{drive_letter}:/nightglow/quicklooks_out/{orbit_start:05d}"
+        f"{drive_letter}:/nightglow/quicklooks_out_cnn_limb/{orbit_start:05d}"
     )
 
     # Input detection CSV
     csv_file = (
         csv_folder
-        / f"{orbit_start:05d}_{orbit_end:05d}_detections_short_1.csv"
+        / f"{orbit_start:05d}_{orbit_end:05d}_detections_short_cnn.csv"
     )
 
     # Output PDF

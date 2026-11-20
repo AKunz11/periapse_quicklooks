@@ -1,3 +1,17 @@
+/*==========================================================*
+ *
+ *   ███╗   ███╗ █████╗ ██╗   ██╗███████╗███╗   ██╗
+ *   ████╗ ████║██╔══██╗██║   ██║██╔════╝████╗  ██║
+ *   ██╔████╔██║███████║██║   ██║█████╗  ██╔██╗ ██║
+ *   ██║╚██╔╝██║██╔══██║╚██╗ ██╔╝██╔══╝  ██║╚██╗██║
+ *   ██║ ╚═╝ ██║██║  ██║ ╚████╔╝ ███████╗██║ ╚████║
+ *   ╚═╝     ╚═╝╚═╝  ╚═╝  ╚═══╝  ╚══════╝╚═╝  ╚═══╝
+ *
+ *                I U V S  /  P E R I A P S E
+ *                  Q U I C K L O O K S
+ *
+ *==========================================================*/
+
 # MAVEN/IUVS Periapse Quicklooks
 
 Generate periapse limb-scan quicklook PDFs and candidate aurora tables from MAVEN/IUVS Level 1B and custom Level 1C data. The main workflow combines spectral and geometry diagnostics with a convolutional neural network (CNN) and fit-quality filters to reject likely cosmic-ray contamination.
@@ -9,6 +23,8 @@ This repository also includes tools for downloading MAVEN SPICE kernels, reviewi
 | Path | Purpose |
 | --- | --- |
 | `limb_aurora_ql_CNN_ssd_updated_v4.py` | Main batch processor. Creates orbit quicklook PDFs, detection CSVs, and per-orbit spectrum archives. |
+| [`side_segments/aurora_ql_side_segment.py`](side_segments/aurora_ql_side_segment.py) | Version of the original quicklook code adapted for inlimb and outlimb observations. |
+| [`sep_events/sep_events_test.py`](sep_events/sep_events_test.py) | Filters aurora detections for candidate solar energetic particle (SEP) events. |
 | `cosmic_ray_model.keras` | Trained CNN used to score integrations for cosmic-ray contamination. |
 | `download_spice.py` | Command-line installer for the generic and MAVEN SPICE kernels used by the quicklook workflow. |
 | `mlr_app.py` | Local Dash application for inspecting an orbit/scan/integration and its MLR components. |
@@ -32,6 +48,8 @@ The scripts currently use Windows-style paths, but their `pathlib`-based setting
 ## Installation
 
 From the repository root, create and activate a virtual environment, then install the pinned dependencies.
+
+For your sake, use a virtual environment (VENV) to easily keep track of libraries.
 
 ```powershell
 py -m venv .venv
@@ -59,6 +77,9 @@ E:/nightglow/
 The main script uses the most recent matching L1C file and matches each L1C scan to the L1B file with the nearest start time.
 
 ## Download SPICE kernels
+
+(NOTICE) I've never actually tested this, so not sure if it works or is necessary.
+At the bare minimum, I know you need `naif0012.tls`, `pck00011.tpc`, `de440s.bsp`, `mar097.bsp`
 
 The downloader treats `--orbit-start` as inclusive and `--orbit-end` as exclusive:
 
@@ -106,7 +127,7 @@ Also update the SPICE path later in the file:
 load_iuvs_spice(spice_directory="E:/periapse_quicklooks_updated/spice")
 ```
 
-`CR_REFERENCE_ORBIT` must exist under `BASE_L1C`; its wavelength grid defines the CNN input grid. `RUN_END` is exclusive, so the example processes orbits 18700 through 18799.
+`CR_REFERENCE_ORBIT` must exist under `BASE_L1C`; its wavelength grid defines the CNN input grid. It can realistically be any l1c file, but safe to use the one that is in there by default. `RUN_END` is exclusive, so the example processes orbits 18700 through 18799.
 
 ## Generate quicklooks
 
@@ -150,6 +171,17 @@ Detector-image shading identifies rejected integrations:
 
 The fit-quality rejection combines the orbit baseline threshold, chi-square threshold, and a solar-continuum coefficient threshold. Low-solar-zenith-angle integrations are also excluded. Yellow outlines on the scan images mark integrations rejected as cosmic rays by either the CNN or the fit-quality method.
 
+## Candidate SEP event criteria
+
+`sep_events/sep_events_test.py` starts with green-flagged MUV detections with Pearson R of at least 0.55 and a `count` of at least 6, excluding rows typed `NONE` or `NON-DET`. A scan can qualify at either level if the detection altitude is at least 50 km and the CO₂⁺ UVD signal-to-noise ratio is at least 3.
+
+| Scan level | Minimum CO₂⁺ UVD radiance (`CO2p_radiance`) | Altitude ceiling |
+| --- | --- | --- |
+| Strong | 0.18 | Below 112 km |
+| Supporting | 0.10 | Below 130 km |
+
+An orbit is flagged as a candidate solar energetic particle (SEP) event if it has at least one strong scan plus a second distinct strong or supporting scan, or at least three distinct supporting scans.
+
 ## Inspect MLR fits interactively
 
 Before starting the viewer, update the L1C and L1B roots in `open_l1c()` and `open_l1b()` in `mlr_app.py`. Then run:
@@ -189,6 +221,13 @@ The merger reads the block detection CSV, excludes yellow (marginal) rows, finds
 - **The Dash viewer cannot find an orbit:** update both path-building functions in `mlr_app.py`; they do not reuse the main script's settings.
 - **A run skips an orbit:** the main workflow skips orbits with missing L1B/L1C inputs, insufficient matching L1B scans, or no pixels above its solar-zenith-angle gate.
 
+
+## Next-up / TODO
+
+- CNN implementation for inlimb/outlimb scans would be beneficial. Sounds really hard, but just follow the steps in my other repo for CNN stuff and it should be straightforward. 
+- SEP event detection may need to be tinkered with. I have it pretty good (I think) right now, but you may need to get creative to try and exclude bright aurora examples. Also should be updated to work with inlimb/outlimb data
+
 ## Credits
 
-The limb-aurora quicklook code was written by Zac Milby and Kyle Connour, with annotations by Jay Cessna and Alexander Kunz. The PDF merger, MLR viewer, and CNN implementation were written by Alexander Kunz.
+The limb-aurora quicklook code was written by Zac Milby and Kyle Connour, with annotations by Jay Cessna and Alexander Kunz. The PDF merger, MLR viewer, CNN implementation, SEP event identifier (WIP) were written by Alexander Kunz.
+Feel free to email if there are any questions. Or find my linkedin or something :D

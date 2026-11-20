@@ -1,4 +1,5 @@
 desktop/
+desktop312/
 laptop/
 spice/
 periapse_quicklooks_clone/
@@ -10,3 +11,5 @@ test.py
 limb_aurora_ql_CNN_ssd.py
 limb_aurora_ql_CNN_ssd_updated_v2.py
 limb_aurora_ql_CNN_ssd_updated_v3.py
+l1c_test.py
+l1c_test2.py
